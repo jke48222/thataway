@@ -188,15 +188,125 @@ enum AXPlan {
         return Array(pool.prefix(count))
     }
 
-    static func run(dataPath: String, outPath: String, count: Int) {
+    // MARK: - Invocation
+
+    /// The snapshot the README's cited numbers come from. `logic-pro.json`
+    /// predates node capture and holds targets only, so defaulting to it made
+    /// the documented command fail on a clean clone.
+    static let defaultDataPath = "bench-data/google-chrome.json"
+    /// Where the README, `holo_axcrop.py` and the findings expect that plan.
+    static let defaultOutPath = "bench-data/axplan-chrome.json"
+    /// The Chrome snapshot yields exactly 12 deduplicated targets, and the
+    /// cited result is "12 of 12"; any lower default silently measures less.
+    static let defaultTargets = 12
+
+    struct Invocation: Equatable {
+        var dataPath: String
+        var outPath: String
+        var count: Int
+    }
+
+    /// Resolve `axplan`'s flags into paths, without touching the filesystem
+    /// beyond asking whether `--out` names a directory.
+    ///
+    /// - `--data` omitted: the Chrome snapshot, written to the cited plan.
+    /// - `--data` given, `--out` omitted: `<stem>-axplan.json` beside the
+    ///   snapshot, the first name `live_eval.py` looks for. Falling back to a
+    ///   single shared file would let one app's plan overwrite another's.
+    /// - `--out` names a directory: the same derived filename inside it.
+    ///
+    /// A flag with no value (`axplan --data`) is an error, not a crash.
+    static func parseInvocation(
+        _ args: [String], targets: Int?,
+        isDirectory: (String) -> Bool = AXPlan.isDirectory
+    ) -> Result<Invocation, InvocationError> {
+        func value(of flag: String) -> Result<String?, InvocationError> {
+            guard let i = args.lastIndex(of: flag) else { return .success(nil) }
+            let j = i + 1
+            guard j < args.count, !args[j].hasPrefix("--"), !args[j].isEmpty else {
+                return .failure(.missingValue(flag))
+            }
+            return .success(args[j])
+        }
+        let data: String?, out: String?
+        switch value(of: "--data") {
+        case .failure(let e): return .failure(e)
+        case .success(let v): data = v
+        }
+        switch value(of: "--out") {
+        case .failure(let e): return .failure(e)
+        case .success(let v): out = v
+        }
+        if let t = targets, t < 1 { return .failure(.badTargets(t)) }
+
+        let dataPath = data ?? defaultDataPath
+        let derivedName = data == nil
+            ? (defaultOutPath as NSString).lastPathComponent
+            : ((dataPath as NSString).lastPathComponent as NSString)
+                .deletingPathExtension + "-axplan.json"
+        let outPath: String
+        switch out {
+        case nil where data == nil:
+            outPath = defaultOutPath
+        case nil:
+            outPath = ((dataPath as NSString).deletingLastPathComponent as NSString)
+                .appendingPathComponent(derivedName)
+        case let o? where o.hasSuffix("/") || isDirectory(o):
+            outPath = (o as NSString).appendingPathComponent(derivedName)
+        case let o?:
+            outPath = o
+        }
+        return .success(Invocation(dataPath: dataPath, outPath: outPath,
+                                   count: targets ?? defaultTargets))
+    }
+
+    enum InvocationError: Error, Equatable, CustomStringConvertible {
+        case missingValue(String)
+        case badTargets(Int)
+        var description: String {
+            switch self {
+            case .missingValue(let f): return "\(f) needs a value"
+            case .badTargets(let n): return "--targets must be at least 1 (got \(n))"
+            }
+        }
+    }
+
+    static func isDirectory(_ path: String) -> Bool {
+        var dir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &dir) && dir.boolValue
+    }
+
+    /// Entry point for the subcommand. Returns the process exit status so a
+    /// broken benchmark fails CI instead of printing an error and exiting 0.
+    static func command(_ args: [String], targets: Int?) -> Int32 {
+        switch parseInvocation(args, targets: targets) {
+        case .failure(let e):
+            printError("axplan: \(e)")
+            return 2
+        case .success(let inv):
+            return run(dataPath: inv.dataPath, outPath: inv.outPath, count: inv.count)
+        }
+    }
+
+    static func printError(_ message: String) {
+        FileHandle.standardError.write(Data("  \(message)\n".utf8))
+    }
+
+    // MARK: - Run
+
+    /// - Returns: 0 on success, 1 when the snapshot cannot be measured or the
+    ///   plan cannot be written.
+    @discardableResult
+    static func run(dataPath: String, outPath: String, count: Int) -> Int32 {
         guard let snap = load(dataPath) else {
-            print("  Could not load \(dataPath) — re-run `snap` to regenerate it with node data.")
-            return
+            printError("Could not load \(dataPath) — it is missing, unreadable, or has no "
+                       + "node data. Re-run `snap` to regenerate it with node data.")
+            return 1
         }
         let chosen = sample(snap, count: count)
         guard !chosen.isEmpty else {
-            print("  No usable targets in \(dataPath) — nothing to measure.")
-            return
+            printError("No usable targets in \(dataPath) — nothing to measure.")
+            return 1
         }
         print("\n\u{001B}[1m── AX RESOLVER \u{001B}[0m")
         print("  \(snap.nodes.count) nodes, \(snap.targets.count) labelled targets, "
@@ -282,10 +392,15 @@ enum AXPlan {
             "resolve_p50_ms": times.p50, "resolve_p90_ms": times.p90,
             "plans": plans,
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: payload,
-                                                  options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: URL(fileURLWithPath: outPath))
-            print("\n  Wrote \(outPath)")
+        do {
+            let data = try JSONSerialization.data(withJSONObject: payload,
+                                                  options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: outPath), options: .atomic)
+        } catch {
+            printError("Could not write \(outPath): \(error.localizedDescription)")
+            return 1
         }
+        print("\n  Wrote \(outPath)")
+        return 0
     }
 }

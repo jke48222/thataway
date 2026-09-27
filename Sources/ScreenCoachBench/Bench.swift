@@ -60,10 +60,15 @@ struct Bench {
                          ? "Calendar now EXCLUDED" : "Calendar allowed"))
             }
             print("  watching for 8s — edit the file now…")
-            let deadline = Date().addingTimeInterval(8)
-            while Date() < deadline {
-                RunLoop.main.run(until: Date().addingTimeInterval(0.2))
-            }
+            // The store's file watcher and its re-arm both run on the main
+            // queue. Suspending the async main (which runs on the main actor)
+            // hands that queue back to the runtime's main executor, so the
+            // events are delivered while we wait — no RunLoop spinning, which
+            // is unavailable from async contexts and an error in Swift 6.
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            // `store` is not mentioned after `onChange` is set, and its
+            // deinit stops the watcher; pin it until the window closes.
+            withExtendedLifetime(store) {}
             print("  \(seen) live reload(s) observed")
         case "windows":
             // Which windows ScreenCaptureKit will actually hand over — not
@@ -82,11 +87,7 @@ struct Bench {
                 }
             }
         case "axplan":
-            AXPlan.run(dataPath: args.firstIndex(of: "--data").map { args[$0 + 1] }
-                                 ?? "bench-data/logic-pro.json",
-                       outPath: args.firstIndex(of: "--out").map { args[$0 + 1] }
-                                ?? "bench-data/axplan.json",
-                       count: opts.targets)
+            exit(AXPlan.command(args, targets: opts.targets))
         case "dump":    dumpTree(opts)
         case "apps":    surveyApps(opts)
         case "capture": await benchCapture(opts)
@@ -128,9 +129,12 @@ struct Bench {
               --scope S      capture scope: display | window   (default window)
               --max-nodes N  AX node cap (default 2500)
               --deadline MS  AX walk deadline (default 250)
-              --targets N    Targets to measure in axplan (default 10)
+              --targets N    Targets to measure in axplan (default 12)
               --data PATH    Snapshot JSON for axplan
-              --out PATH     Output path
+                             (default bench-data/google-chrome.json)
+              --out PATH     Output path; for axplan a file or a directory
+                             (default bench-data/axplan-chrome.json, or
+                             <snapshot>-axplan.json beside a given --data)
               --verbose      Per-trial detail
             """)
         }
@@ -144,7 +148,8 @@ struct Bench {
         var delay = 0
         var scope = "window"
         var maxNodes = 2500
-        var targets = 10
+        /// nil means "the subcommand's own default" (axplan: 12).
+        var targets: Int?
         var verbose = false
 
         init(_ args: [String]) {

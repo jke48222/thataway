@@ -70,10 +70,13 @@ enum BudgetCheck {
         //
         // So this is reported as information about the vision path rather than
         // as a budget stage, and `hotkeyToFrame` is honestly left unmeasured.
+        // The user's own rules, not only the defaults: the bench captures
+        // the same display the app would, so it cuts out the same windows.
+        let rules = ExclusionStore().current
         var captureMs: [Double] = []
         for _ in 0..<Swift.min(trials, 10) {
             let t0 = Mono.nowNs()
-            if ScreenGrab.display(containing: bounds) != nil {
+            if ScreenGrab.display(containing: bounds, exclusions: rules) != nil {
                 captureMs.append(Mono.msSince(t0))
             }
         }
@@ -83,7 +86,8 @@ enum BudgetCheck {
                 serverScript: URL(fileURLWithPath: "Tools/holo_server.py"),
                 modelPath: FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent("models/holo1.5-7b-4bit").path)
-            if service.startIfNeeded(), let shot = ScreenGrab.display(containing: bounds) {
+            if service.startIfNeeded(),
+               let shot = ScreenGrab.display(containing: bounds, exclusions: rules) {
                 let hint = AXResolver.cropHint(query: pool[0], in: tree.nodes,
                                                windowBounds: bounds)
                 let crop = hint.isWholeWindow ? nil : CGRect(

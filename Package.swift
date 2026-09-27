@@ -52,5 +52,13 @@ let package = Package(
             dependencies: ["ScreenCoachKit", "ScreenCoachCore"],
             path: "Tests/ScreenCoachKitTests"
         ),
+
+        // The bench CLI's argument handling, which the README's reproduce
+        // command and CI depend on.
+        .testTarget(
+            name: "ScreenCoachBenchTests",
+            dependencies: ["screencoach-bench"],
+            path: "Tests/ScreenCoachBenchTests"
+        ),
     ]
 )
