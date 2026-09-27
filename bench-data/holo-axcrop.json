@@ -1,5 +1,5 @@
 {
-  "model": "/Users/jalenedusei/models/holo1.5-7b-4bit",
+  "model": "~/models/holo1.5-7b-4bit",
   "results": {
     "full": [
       {

@@ -15,3 +15,12 @@ bench-data/*.png
 # Local machine state
 .DS_Store
 *.log
+
+# Python bytecode from the Tools/ harnesses
+__pycache__/
+*.pyc
+
+# Local secrets
+.env
+.env.*
+!.env.example
