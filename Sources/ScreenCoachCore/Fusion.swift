@@ -159,9 +159,9 @@ public enum Fusion {
                     label: a.label,
                     explanation: sameScreen
                         ? String(format: "the accessibility tree and the vision model disagree "
-                                       + "by %.0f pt — pointing at the tree's answer", gap)
+                                       + "by %.0f pt: pointing at the tree's answer", gap)
                         : "the accessibility tree and the vision model point at different "
-                        + "displays — pointing at the tree's answer"
+                        + "displays: pointing at the tree's answer"
                 )
             }
 
@@ -181,7 +181,7 @@ public enum Fusion {
                            + (sameScreen
                               ? String(format: "is %.0f pt from the vision model's answer", gap)
                               : "is on a different display from the vision model's answer")
-                           + " — pointing at the vision model's guess"
+                           + ": pointing at the vision model's guess"
             )
 
         case (.none, .none):

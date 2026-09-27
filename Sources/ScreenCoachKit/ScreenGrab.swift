@@ -54,7 +54,7 @@ public enum ScreenGrab {
         // ago fails here even if the cached tree still has the old title.
         if let targetPID,
            let why = frontWindowExclusion(pid: targetPID, exclusions: exclusions) {
-            NSLog("ScreenCoach: not capturing — \(why)")
+            NSLog("ScreenCoach: not capturing: \(why)")
             return nil
         }
 

@@ -187,13 +187,13 @@ public enum BuiltInLessons {
     public static let preferences = Lesson(
         title: "Open this app's settings",
         steps: [
-            Step(instruction: "Open the {app} menu — right next to the Apple menu",
+            Step(instruction: "Open the {app} menu, right next to the Apple menu",
                  target: "the {app} menu",
                  completion: .elementAppears("Settings")),
             Step(instruction: "Choose Settings",
                  target: "the Settings menu item",
                  completion: .elementDisappears("Settings")),
-            Step(instruction: "That's the settings window — have a look around",
+            Step(instruction: "That's the settings window. Have a look around",
                  target: "the {app} Settings window",
                  completion: .manual),
         ]

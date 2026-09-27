@@ -538,9 +538,9 @@ public final class AXCache {
 
     public var statusLine: String {
         lock.lock(); defer { lock.unlock() }
-        if let why = exclusionReason { return "excluded — \(why)" }
+        if let why = exclusionReason { return "excluded: \(why)" }
         guard let e = entry else { return "no tree cached" }
-        return String(format: "%@ — %d nodes, %.0f ms old, %d refreshes, %d warm / %d cold",
+        return String(format: "%@: %d nodes, %.0f ms old, %d refreshes, %d warm / %d cold",
                       e.snapshot.appName, e.snapshot.nodeCount, e.ageMs,
                       refreshCount, warmCount, coldCount)
     }

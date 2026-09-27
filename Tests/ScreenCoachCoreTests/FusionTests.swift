@@ -308,7 +308,7 @@ final class ExclusionListTests: XCTestCase {
     func testCommentOnlyPatternIsNotARule() {
         let report = ExclusionList.parseReport("bundle:   # fill this in")
         XCTAssertTrue(report.list.rules.isEmpty, "the comment must not become the pattern")
-        XCTAssertEqual(report.issues.first?.message, "rule has no pattern — ignored")
+        XCTAssertEqual(report.issues.first?.message, "rule has no pattern: ignored")
     }
 
     /// The seeded file is the example users copy from, so its examples must

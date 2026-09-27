@@ -228,7 +228,7 @@ public struct LessonProgress: Equatable {
     }
 
     public var caption: String {
-        guard let current else { return "\(lesson.title) — done" }
+        guard let current else { return "\(lesson.title): done" }
         return "\(stepNumber)/\(totalSteps)  \(current.instruction)"
     }
 }

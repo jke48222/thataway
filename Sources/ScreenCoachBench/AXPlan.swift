@@ -299,13 +299,13 @@ enum AXPlan {
     @discardableResult
     static func run(dataPath: String, outPath: String, count: Int) -> Int32 {
         guard let snap = load(dataPath) else {
-            printError("Could not load \(dataPath) — it is missing, unreadable, or has no "
+            printError("Could not load \(dataPath): it is missing, unreadable, or has no "
                        + "node data. Re-run `snap` to regenerate it with node data.")
             return 1
         }
         let chosen = sample(snap, count: count)
         guard !chosen.isEmpty else {
-            printError("No usable targets in \(dataPath) — nothing to measure.")
+            printError("No usable targets in \(dataPath): nothing to measure.")
             return 1
         }
         print("\n\u{001B}[1m── AX RESOLVER \u{001B}[0m")

@@ -103,7 +103,7 @@ public final class ExclusionStore {
         // said out loud, not silently reinterpreted.
         for issue in report.issues {
             NSLog("ScreenCoach: \(url.lastPathComponent) line \(issue.line): "
-                  + "\(issue.message) — “\(issue.text)”")
+                  + "\(issue.message): “\(issue.text)”")
         }
         lock.lock()
         parseIssues = report.issues

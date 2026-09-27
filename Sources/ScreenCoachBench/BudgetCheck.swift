@@ -17,7 +17,7 @@ enum BudgetCheck {
     static func run(trials: Int, includeVision: Bool) -> Int32 {
         print("\n\u{001B}[1m── LATENCY BUDGET \u{001B}[0m")
         guard AXExtractor.isTrusted else {
-            print("  Accessibility not granted — cannot measure.")
+            print("  Accessibility not granted: cannot measure.")
             return 2
         }
 
@@ -31,11 +31,11 @@ enum BudgetCheck {
         // number the shipping app never pays.
         Thread.sleep(forTimeInterval: 0.5)
         guard let tree = cache.tree() else {
-            print("  No accessible frontmost window — focus an app and re-run.")
+            print("  No accessible frontmost window: focus an app and re-run.")
             return 3
         }
         let bounds = extent(of: tree)
-        print("  Target: \(tree.appName) — \(tree.nodeCount) nodes, "
+        print("  Target: \(tree.appName): \(tree.nodeCount) nodes, "
               + "\(tree.labelledCount) labelled\n")
 
         // Queries drawn from the app's own labels, so the resolver is doing
@@ -125,13 +125,13 @@ enum BudgetCheck {
 
         let (violations, unmeasured) = LatencyBudget.check(samples)
         let axHit = LatencyBudget.pathTotalP50(samples, stages: LatencyBudget.axHitPath)
-        print(String(format: "\n  AX-hit path total (p50 sum): %.2f ms  — target %.0f ms  %@",
+        print(String(format: "\n  AX-hit path total (p50 sum): %.2f ms, target %.0f ms  %@",
                      axHit, LatencyBudget.totalAXHitMs,
                      axHit <= LatencyBudget.totalAXHitMs ? "PASS" : "FAIL"))
 
         if !unmeasured.isEmpty {
             print("  unmeasured: " + unmeasured.map(\.label).joined(separator: ", "))
-            print("  (not counted as passing — these need the running app or a human)")
+            print("  (not counted as passing: these need the running app or a human)")
         }
         if violations.isEmpty {
             print("\n  \u{001B}[1mBUDGET OK\u{001B}[0m")

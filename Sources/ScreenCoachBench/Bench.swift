@@ -48,18 +48,18 @@ struct Bench {
             // running process must pick up an edit before the next query, or
             // "excluding your bank" realistically means "restart the coach",
             // which nobody does.
-            header("EXCLUSION LIST — LIVE RELOAD")
+            header("EXCLUSION LIST: LIVE RELOAD")
             let store = ExclusionStore()
             print("  file: \(store.url.path)")
             print("  \(store.statusLine)")
             var seen = 0
             store.onChange = { list in
                 seen += 1
-                print("  reload #\(seen): \(list.rules.count) rules — "
+                print("  reload #\(seen): \(list.rules.count) rules: "
                       + (list.check(bundleID: "com.apple.iCal", windowTitle: nil).excluded
                          ? "Calendar now EXCLUDED" : "Calendar allowed"))
             }
-            print("  watching for 8s — edit the file now…")
+            print("  watching for 8s: edit the file now…")
             // The store's file watcher and its re-arm both run on the main
             // queue. Suspending the async main (which runs on the main actor)
             // hands that queue back to the runtime's main executor, so the
@@ -192,8 +192,8 @@ struct Bench {
 
         header("PERMISSIONS")
         let ax = AXExtractor.isTrusted
-        print("  Accessibility      \(ax ? "GRANTED" : "DENIED — AX grounding and the event tap are both blocked")")
-        print("  Screen Recording   \(CGPreflightScreenCaptureAccess() ? "GRANTED" : "DENIED — capture will fail")")
+        print("  Accessibility      \(ax ? "GRANTED" : "DENIED: AX grounding and the event tap are both blocked")")
+        print("  Screen Recording   \(CGPreflightScreenCaptureAccess() ? "GRANTED" : "DENIED: capture will fail")")
 
         header("DISPLAYS")
         let space = DisplaySpace.current()
@@ -214,7 +214,7 @@ struct Bench {
         header("(b) AX TREE EXTRACTION")
 
         guard AXExtractor.isTrusted else {
-            print("  SKIPPED — Accessibility not granted.")
+            print("  SKIPPED: Accessibility not granted.")
             print("  Grant it to this binary, then re-run. Without it there is no")
             print("  primary grounding path and the whole thesis is untested.")
             return
@@ -320,7 +320,7 @@ struct Bench {
         guard let tree = try? AXExtractor.windowTree(
             pid: pid, appName: appName, bundleID: w.owningApplication?.bundleIdentifier,
             strategy: .batched, limits: o.limits, displays: space
-        ) else { print("  AX extraction failed — PNG saved without ground truth."); return }
+        ) else { print("  AX extraction failed: PNG saved without ground truth."); return }
 
         // Ground truth lives in DISPLAY pixels, not window-relative pixels.
         //
@@ -362,7 +362,7 @@ struct Bench {
             }
         }
         guard scale > 0, displayImageSize.count == 2 else {
-            print("  Display capture failed — cannot build ground truth."); return
+            print("  Display capture failed: cannot build ground truth."); return
         }
 
         func toDisplayPx(_ r: CGRect) -> [Double] {
@@ -431,7 +431,7 @@ struct Bench {
         // the 107-node capture an evaluation depended on. Snapshots are eval
         // inputs, and a zero-target one is never the better version.
         if items.isEmpty {
-            print("  REFUSING TO WRITE — 0 usable targets (tree has \(tree.nodeCount) nodes).")
+            print("  REFUSING TO WRITE: 0 usable targets (tree has \(tree.nodeCount) nodes).")
             print("  The window is probably fullscreen or has no exposed chrome.")
             if FileManager.default.fileExists(atPath: jsonPath) {
                 print("  Kept the existing \(jsonPath).")
@@ -490,7 +490,7 @@ struct Bench {
             print(String(format: "  cold/warm ratio         %8.1fx", cold.extractionMs / w.p50))
         }
 
-        print("\n  Decay — does the tree go cold again if left alone?")
+        print("\n  Decay: does the tree go cold again if left alone?")
         for pause in [1, 2, 5, 10] {
             Thread.sleep(forTimeInterval: Double(pause))
             guard let s = walk() else { continue }
@@ -511,14 +511,14 @@ struct Bench {
     static func surveyApps(_ o: Options) {
         header("GROUNDABILITY SURVEY")
         guard AXExtractor.isTrusted else {
-            print("  SKIPPED — Accessibility not granted.")
+            print("  SKIPPED: Accessibility not granted.")
             return
         }
         print("  Which apps can be grounded from the accessibility tree alone.")
         print("  'labelled' is the number that predicts it: elements with no")
         print("  title, description, help or identifier are invisible to")
         print("  semantic matching and force the vision fallback.\n")
-        print("  Cold is first touch; warm is the p50 of five further walks —")
+        print("  Cold is first touch; warm is the p50 of five further walks:")
         print("  what the coach actually pays if it extracts speculatively on")
         print("  focus change instead of waiting for the hotkey.\n")
         print("  " + "APP".pad(24) + "cold ms".padLeft(9) + "warm ms".padLeft(9)
@@ -552,7 +552,7 @@ struct Bench {
             }
             let warm = LatencySamples(stage: .axExtract, values: warmValues)
             let note = snap.truncated ? (snap.truncationReason ?? "truncated")
-                     : (snap.labelledFraction < 0.33 ? "sparse labels — expect vision fallback" : "")
+                     : (snap.labelledFraction < 0.33 ? "sparse labels: expect vision fallback" : "")
             print("  " + name.clipped(24).pad(24)
                   + String(format: "%.1f", snap.extractionMs).padLeft(9)
                   + (warm.isEmpty ? "—" : String(format: "%.1f", warm.p50)).padLeft(9)
@@ -576,7 +576,7 @@ struct Bench {
             strategy: .batched, limits: o.limits, displays: space
         ) else { print("Extraction failed for \(target.name)"); return }
 
-        header("AX TREE — \(snap.appName)")
+        header("AX TREE: \(snap.appName)")
         print("  window: \(snap.windowTitle ?? "untitled")")
         if let b = snap.windowBounds {
             print(String(format: "  bounds: (%.0f, %.0f) %.0f×%.0f  screen %d",
@@ -606,7 +606,7 @@ struct Bench {
     static func benchCapture(_ o: Options) async {
         header("(a) CAPTURE")
         guard CGPreflightScreenCaptureAccess() else {
-            print("  SKIPPED — Screen Recording not granted.")
+            print("  SKIPPED: Screen Recording not granted.")
             print("  Run `screencoach-bench doctor` after granting it.")
             return
         }
@@ -674,7 +674,7 @@ struct Bench {
         printRow("warm grab", grabValues, note: "retrieve newest complete frame")
         printRow("warm materialize", materializeValues, note: "CVPixelBuffer → CGImage")
         printRow("frame staleness", ageValues,
-                 note: "age of newest frame — the cost of not waiting")
+                 note: "age of newest frame: the cost of not waiting")
 
         // --- 3. One-shot SCScreenshotManager.
         var shotValues: [Double] = []
@@ -698,8 +698,8 @@ struct Bench {
 
         print("\n  Stream delivered \(warm.completeFrames) complete / \(warm.idleFrames) idle frames.")
         print("  Idle frames are why the design keeps the newest complete frame")
-        print("  instead of awaiting the next one: on a still screen — which is")
-        print("  exactly what a user asking about a UI is looking at — the next")
+        print("  instead of awaiting the next one: on a still screen, which is")
+        print("  exactly what a user asking about a UI is looking at, the next")
         print("  frame may never arrive.")
 
         let grab = LatencySamples(stage: .hotkeyToFrame, values: grabValues)
@@ -825,7 +825,7 @@ struct Bench {
     static func benchHotkey(_ o: Options) async {
         header("(a) HOTKEY → FRAME, END TO END")
         guard AXExtractor.isTrusted else {
-            print("  Accessibility not granted — an event tap cannot be created.")
+            print("  Accessibility not granted: an event tap cannot be created.")
             return
         }
         guard CGPreflightScreenCaptureAccess() else {

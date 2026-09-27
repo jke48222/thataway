@@ -93,7 +93,7 @@ public final class Voice: NSObject {
         }
         guard recognizer.isAvailable else { return .unavailable("recogniser unavailable") }
         if localOnly && !recognizer.supportsOnDeviceRecognition {
-            return .unavailable("no on-device model for this locale — "
+            return .unavailable("no on-device model for this locale: "
                               + "voice is off rather than sending audio to a server")
         }
         return .ready(onDevice: recognizer.supportsOnDeviceRecognition)
@@ -156,7 +156,7 @@ public final class Voice: NSObject {
                 requestPermissions { [weak self] a in
                     guard let self else { return }
                     if case .ready = a {
-                        self.onState?("voice ready — hold ⌥Space and speak")
+                        self.onState?("voice ready: hold ⌥Space and speak")
                     } else {
                         self.onState?(self.describe(a))
                     }

@@ -129,14 +129,14 @@ public final class GroundingService {
             lock.unlock(); return false
         }
         guard FileManager.default.fileExists(atPath: modelPath) else {
-            currentState = .failed("no model at \(modelPath) — vision fallback disabled")
+            currentState = .failed("no model at \(modelPath): vision fallback disabled")
             lock.unlock(); return false
         }
         currentState = .loading
         lock.unlock()
 
         guard let python = resolvePython() else {
-            failLaunch("no Python with mlx_vlm and Pillow found — set "
+            failLaunch("no Python with mlx_vlm and Pillow found: set "
                        + "\(Self.pythonEnvironmentKey) or the \(Self.pythonDefaultsKey) "
                        + "default to an interpreter that has them")
             return false
@@ -289,7 +289,7 @@ public final class GroundingService {
         case .timedOut:
             // Never reuse a pipe that may still deliver this late answer:
             // kill the sidecar so the next miss relaunches clean.
-            NSLog(String(format: "ScreenCoach: grounding timed out after %.0f s — "
+            NSLog(String(format: "ScreenCoach: grounding timed out after %.0f s: "
                          + "restarting the sidecar on the next miss", timeout))
             teardown(state: .failed(String(format: "timed out after %.0f s; "
                                            + "restarts on the next miss", timeout)))
@@ -301,7 +301,7 @@ public final class GroundingService {
         }
 
         if let error = response["error"] as? String {
-            NSLog("ScreenCoach: grounding failed — \(error)")
+            NSLog("ScreenCoach: grounding failed: \(error)")
             return nil
         }
         guard let rx = response["x"] as? Double, let ry = response["y"] as? Double else {
@@ -437,7 +437,7 @@ public final class GroundingService {
         guard let last = text.split(separator: "\n").last(where: {
             !$0.trimmingCharacters(in: .whitespaces).isEmpty
         }) else { return "" }
-        return " — " + last.trimmingCharacters(in: .whitespaces).prefix(200)
+        return ": " + last.trimmingCharacters(in: .whitespaces).prefix(200)
     }
 
     enum ReadOutcome {
@@ -508,7 +508,7 @@ public final class GroundingService {
         case .ready(let m, let s):
             return String(format: "vision: ready (%@, %.1fs)",
                           (m as NSString).lastPathComponent, s)
-        case .failed(let why): return "vision: unavailable — \(why)"
+        case .failed(let why): return "vision: unavailable (\(why))"
         }
     }
 }

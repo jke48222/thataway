@@ -213,7 +213,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { self?.releaseHold(at: upNs) }
         }
         do { try tap.start() } catch {
-            NSLog("ScreenCoach: hotkey tap failed — \(error)")
+            NSLog("ScreenCoach: hotkey tap failed: \(error)")
         }
         hotkey = tap
 
@@ -266,7 +266,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             guard let step else {
                 self.stopLessonRendering()
                 self.overlay.hide()
-                self.voice.speak("That's it — \(progress.lesson.title) done.")
+                self.voice.speak("That's it. \(progress.lesson.title) is done.")
                 NSLog("ScreenCoach: lesson finished")
                 return
             }
@@ -285,9 +285,9 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             guard let self else { return }
             switch reason {
             case .manualStep:
-                NSLog("ScreenCoach: step \(progress.stepNumber) is manual — waiting for Next Step")
+                NSLog("ScreenCoach: step \(progress.stepNumber) is manual, waiting for Next Step")
             case .timedOut:
-                NSLog("ScreenCoach: step \(progress.stepNumber) not seen to finish — waiting for Next Step")
+                NSLog("ScreenCoach: step \(progress.stepNumber) not seen to finish, waiting for Next Step")
                 self.voice.speak("I can't tell whether that's done. "
                                  + "Choose Next Step from the menu to continue.")
                 self.setActivity("Step \(progress.stepNumber): choose Next Step to continue",
@@ -436,17 +436,17 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         }
         recorder.onStep = { [weak self] recorded, count in
             self?.commandBar.setStatus("recorded \(count): \(recorded.clickedLabel)")
-            NSLog("ScreenCoach: recorded step \(count) — \(recorded.step.target)")
+            NSLog("ScreenCoach: recorded step \(count): \(recorded.step.target)")
         }
         recorder.onSkipped = { reason in
-            NSLog("ScreenCoach: click skipped — \(reason)")
+            NSLog("ScreenCoach: click skipped: \(reason)")
         }
         do {
             try recorder.start()
             recordItem?.title = "Stop Recording & Save"
             voice.speak("Recording. Click through the steps, then stop from the menu.")
         } catch {
-            NSLog("ScreenCoach: recorder failed — \(error)")
+            NSLog("ScreenCoach: recorder failed: \(error)")
         }
     }
 
@@ -461,7 +461,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             voice.speak("Saved \(lesson.steps.count) steps.")
             NSLog("ScreenCoach: workflow saved to \(url.path)")
         } catch {
-            NSLog("ScreenCoach: save failed — \(error)")
+            NSLog("ScreenCoach: save failed: \(error)")
         }
     }
 
@@ -524,15 +524,15 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
     private func requestVoicePermissionsIfUndetermined() {
         guard !voicePermissionAsked, voicePermissionUndetermined else { return }
         guard canAskForVoicePermission else {
-            NSLog("ScreenCoach: voice needs the bundled app (no usage strings) — typing only")
+            NSLog("ScreenCoach: voice needs the bundled app (no usage strings), typing only")
             return
         }
         voicePermissionAsked = true
         voice.requestPermissions { [weak self] availability in
             guard let self else { return }
-            NSLog("ScreenCoach: voice permissions — \(Voice.permissionSummary)")
+            NSLog("ScreenCoach: voice permissions: \(Voice.permissionSummary)")
             if self.commandBar.isVisible, !self.voice.isListening {
-                self.commandBar.setStatus(self.voiceNote(for: availability) ?? "Voice ready — hold ⌥Space to speak")
+                self.commandBar.setStatus(self.voiceNote(for: availability) ?? "Voice ready: hold ⌥Space to speak")
             }
         }
     }
@@ -545,15 +545,15 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             return nil
         case .needsPermission(let what):
             if voicePermissionUndetermined && canAskForVoicePermission {
-                return "Allow \(what) access to speak — type for now"
+                return "Allow \(what) access to speak, or type for now"
             }
             if !canAskForVoicePermission {
-                return "Voice needs the bundled app — type instead"
+                return "Voice needs the bundled app. Type instead"
             }
-            return "\(what) permission is off — type instead, or allow it in "
+            return "\(what) permission is off. Type instead, or allow it in "
                  + "System Settings › Privacy & Security"
         case .unavailable(let why):
-            return "Voice unavailable (\(why)) — type instead"
+            return "Voice unavailable (\(why)). Type instead"
         }
     }
 
@@ -571,7 +571,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         listeningTurn = turns.current
         heardThisHold = false
         voice.begin()
-        guard voice.isListening else { return "The microphone didn't start — type instead" }
+        guard voice.isListening else { return "The microphone didn't start. Type instead" }
         armHoldExpiry()
         return nil
     }
@@ -590,7 +590,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             if case .finishUtterance = self.ptt.expire(atNs: Mono.nowNs()), self.voice.isListening {
-                NSLog("ScreenCoach: hold outlived its limit — closing the microphone")
+                NSLog("ScreenCoach: hold outlived its limit, closing the microphone")
                 self.voice.end()
             }
         }
@@ -674,7 +674,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             tree.appName, tree.labelledCount, cache.cachedEntry?.ageMs ?? 0
         )
         if voice.isListening {
-            status = "Listening — release to go · " + status
+            status = "Listening. Release to go · " + status
         } else if let voiceNote {
             status = voiceNote + " · " + status
         }
@@ -690,7 +690,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
                 accessibilityPromptOffered = true
                 AXExtractor.requestPermission()
             }
-            return "Accessibility access is off — allow Screen Coach in "
+            return "Accessibility access is off. Allow Screen Coach in "
                  + "System Settings › Privacy & Security › Accessibility."
         }
         if let why = cache.lastExclusionReason {
@@ -698,7 +698,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             let front = NSWorkspace.shared.frontmostApplication
             let name = front.flatMap { $0.processIdentifier == me ? nil : $0.localizedName }
                 ?? "this app"
-            return "Not looking at \(name) — it is excluded (\(why))."
+            return "Not looking at \(name): it is excluded (\(why))."
         }
         return "No accessible window in front."
     }
@@ -797,10 +797,10 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             let why = verdict.reason ?? freshRefusal ?? "excluded"
             if axOnly != nil {
                 present(axOnly, query: query, tree: tree, spoken: spoken,
-                        note: "not captured — \(why)")
+                        note: "not captured: \(why)")
             } else {
                 notify("Nothing in \(tree.appName)'s accessibility tree matches “\(query)”, "
-                       + "and the screen was not captured — \(why).")
+                       + "and the screen was not captured: \(why).")
             }
             return
         }
@@ -847,7 +847,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
                               tree: AXTreeSnapshot, ax: Fusion.AXCandidate?,
                               provisional: Fusion.Decision?, spoken: Bool) {
         guard turns.isCurrent(turn) else {
-            NSLog("ScreenCoach: dropped a vision answer for “\(query)” — a newer turn owns the screen")
+            NSLog("ScreenCoach: dropped a vision answer for “\(query)”: a newer turn owns the screen")
             return
         }
         pendingVision = nil
@@ -882,8 +882,8 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         // seconds ago is not what is on the display now.
         let target = extent(of: tree)
         if let refusal = captureRefusal(for: tree, displayIndex: target.screenIndex) {
-            NSLog("ScreenCoach: capture refused — \(refusal)")
-            return VisionOutcome(whyNot: "screen not captured — \(refusal)")
+            NSLog("ScreenCoach: capture refused: \(refusal)")
+            return VisionOutcome(whyNot: "screen not captured: \(refusal)")
         }
         // ScreenGrab applies the rules to the frame itself: excluded apps,
         // windows with excluded titles and the coach's own overlay are cut
@@ -1103,7 +1103,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         guard let tree = cache.tree(), !tree.nodes.isEmpty else {
             print("No accessible frontmost window."); exit(3)
         }
-        print("App        \(tree.appName) — \(tree.nodeCount) nodes")
+        print("App        \(tree.appName): \(tree.nodeCount) nodes")
 
         // Two synthetic trees standing in for before/after, so the engine is
         // exercised against this app's real labels rather than fixtures.
@@ -1168,9 +1168,9 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         if let hit = WorkflowInference.hitTest(centre, in: before) {
             let same = hit.id == sample.id
             print("HitTest    centre of “\(label)” → \(hit.title ?? hit.role) "
-                  + (same ? "(exact)" : "(different element — acceptable if nested)"))
+                  + (same ? "(exact)" : "(different element, acceptable if nested)"))
         } else {
-            print("HitTest    FAILED — centre of a labelled element resolved to nothing")
+            print("HitTest    FAILED: centre of a labelled element resolved to nothing")
             watchOK = false
         }
         if let recordedQuery = WorkflowInference.semanticQuery(for: sample, in: before) {
@@ -1184,19 +1184,19 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
                 let ranked = AXResolver.rank(query: loaded.steps[0].target, in: before,
                                              windowBounds: extent(of: tree), limit: 1)
                 if let best = ranked.first, best.score >= AXResolver.hitThreshold {
-                    print(String(format: "Replay     loaded from disk, re-grounded at %.2f — %@",
+                    print(String(format: "Replay     loaded from disk, re-grounded at %.2f: %@",
                                  best.score, best.node.title ?? best.node.role))
                 } else {
-                    print("Replay     FAILED — saved query did not re-ground")
+                    print("Replay     FAILED: saved query did not re-ground")
                     watchOK = false
                 }
                 try? FileManager.default.removeItem(at: store.directory)
             } else {
-                print("Replay     FAILED — save/load round trip broke")
+                print("Replay     FAILED: save/load round trip broke")
                 watchOK = false
             }
         } else {
-            print("Record     FAILED — no query for a labelled element")
+            print("Record     FAILED: no query for a labelled element")
             watchOK = false
         }
 
@@ -1249,7 +1249,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             let refreshes0 = cache.refreshes
             let t0 = Mono.nowNs()
             print("Measuring \(seconds)s of idle"
-                  + (forceActive ? " (backoff disabled — active-user mode)" : "")
+                  + (forceActive ? " (backoff disabled: active-user mode)" : "")
                   + " over \(cache.cachedEntry?.snapshot.appName ?? "no app")…")
 
             DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds)) { [self] in
@@ -1286,7 +1286,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
     /// should not mean capturing their screen.
     private func runSelfTest(query: String, appName: String?) {
         guard AXExtractor.isTrusted else {
-            print("Accessibility not granted — cannot self-test.")
+            print("Accessibility not granted: cannot self-test.")
             exit(2)
         }
         overlay.rebuildForCurrentDisplays()
@@ -1318,7 +1318,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             usleep(120_000)
         }
         if let why = cache.lastExclusionReason {
-            print("Privacy    EXCLUDED — \(why)")
+            print("Privacy    EXCLUDED: \(why)")
             print("           No tree read, no frame captured. Nothing to point at.")
             exit(0)
         }
@@ -1336,7 +1336,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
                 // excluded app's tree is not read, not even to count it.
                 let verdict = exclusions.check(bundleID: app.bundleIdentifier, windowTitle: nil)
                 if verdict.excluded {
-                    print("  \(name): excluded — not read (\(verdict.reason ?? "excluded"))")
+                    print("  \(name): excluded, not read (\(verdict.reason ?? "excluded"))")
                     continue
                 }
                 do {
@@ -1352,7 +1352,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         }
         let serve = LatencySamples(stage: .axExtract, values: warmTimes)
 
-        print(String(format: "App        %@ — %d nodes, %d labelled, %d actionable",
+        print(String(format: "App        %@: %d nodes, %d labelled, %d actionable",
                      tree.appName, tree.nodeCount, tree.labelledCount, tree.actionableCount))
         print(String(format: "Cache      serve p50 %.3f ms, p90 %.3f ms (%d warm / %d cold)",
                      serve.p50, serve.p90, cache.servedWarm, cache.servedCold))
@@ -1368,7 +1368,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             // Not a failure — this is precisely the case the vision fallback
             // exists for, so the self-test must carry on into it rather than
             // stopping where the accessibility path stops.
-            print("Resolve    no accessibility match — this is the AX-miss path")
+            print("Resolve    no accessibility match: this is the AX-miss path")
         }
         for (i, c) in ranked.enumerated() {
             print(String(format: "  %d. %.2f  %@  cg=(%.0f,%.0f %.0f×%.0f) screen %d",
@@ -1410,17 +1410,17 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             labelledFraction: tree.labelledFraction
         )
         let verdict = exclusions.check(bundleID: tree.bundleID, windowTitle: tree.windowTitle)
-        print("Privacy    \(verdict.excluded ? "EXCLUDED — \(verdict.reason ?? "")" : "allowed") "
+        print("Privacy    \(verdict.excluded ? "EXCLUDED: \(verdict.reason ?? "")" : "allowed") "
               + "(\(exclusions.statusLine))")
         switch voice.availability {
         case .ready(let onDevice):
-            print("Voice      ready — recognition \(onDevice ? "ON-DEVICE" : "SERVER-BACKED")")
+            print("Voice      ready: recognition \(onDevice ? "ON-DEVICE" : "SERVER-BACKED")")
         case .needsPermission(let what):
             print("Voice      \(what) permission not granted yet (\(Voice.permissionSummary))")
         case .unavailable(let why):
-            print("Voice      unavailable — \(why)")
+            print("Voice      unavailable: \(why)")
         }
-        print("Route      \(wantsVision ? "vision fallback would run" : "accessibility only — vision not needed")")
+        print("Route      \(wantsVision ? "vision fallback would run" : "accessibility only, vision not needed")")
 
         var visionCandidate: Fusion.VisionCandidate?
         if wantsVision && !verdict.excluded && CommandLine.arguments.contains("--vision") {
@@ -1431,7 +1431,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
                 print(String(format: "           click cg(%.0f,%.0f) screen %d",
                              v.point.cg.x, v.point.cg.y, v.point.screenIndex))
             } else {
-                print("           unavailable — \(outcome.whyNot ?? grounding.statusLine)")
+                print("           unavailable: \(outcome.whyNot ?? grounding.statusLine)")
             }
         }
 
@@ -1440,7 +1440,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             print("No decision."); exit(4)
         }
         print("Fusion     \(decision.source.rawValue) → "
-              + "\(decision.confidence == .exact ? "exact — solid ring" : "uncertain — dashed ring")")
+              + "\(decision.confidence == .exact ? "exact, solid ring" : "uncertain, dashed ring")")
         if let why = decision.explanation { print("           \(why)") }
 
         overlay.point(at: decision.target,

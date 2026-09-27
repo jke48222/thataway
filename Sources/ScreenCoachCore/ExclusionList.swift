@@ -158,9 +158,9 @@ public struct ExclusionList: Equatable, Sendable {
                 $0.trimmingCharacters(in: .whitespaces)
             }
             guard parts.count == 2 else {
-                note("not a rule — expected “bundle: …” or “title: …”"); continue
+                note("not a rule: expected “bundle: …” or “title: …”"); continue
             }
-            guard !parts[1].isEmpty else { note("rule has no pattern — ignored"); continue }
+            guard !parts[1].isEmpty else { note("rule has no pattern: ignored"); continue }
             switch parts[0].lowercased() {
             case "bundle", "bundleid", "app":
                 // Bundle IDs never contain whitespace, so anything after the
@@ -170,13 +170,13 @@ public struct ExclusionList: Equatable, Sendable {
                 let tokens = parts[1].split(whereSeparator: { $0 == " " || $0 == "\t" })
                 let id = String(tokens[0])
                 if tokens.count > 1 {
-                    note("bundle IDs contain no spaces — using “\(id)” and ignoring the rest")
+                    note("bundle IDs contain no spaces: using “\(id)” and ignoring the rest")
                 }
                 rules.append(Rule(kind: .bundleID, pattern: id))
             case "title":
                 rules.append(Rule(kind: .titleContains, pattern: parts[1]))
             default:
-                note("unknown rule kind “\(parts[0])” — ignored")
+                note("unknown rule kind “\(parts[0])”: ignored")
             }
         }
         return (ExclusionList(rules: rules), issues)

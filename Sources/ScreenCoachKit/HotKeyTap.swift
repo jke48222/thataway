@@ -70,7 +70,7 @@ public final class HotKeyTap {
     public enum TapError: Error, CustomStringConvertible {
         case tapCreationFailed
         public var description: String {
-            "CGEvent.tapCreate failed — Accessibility permission is required for event taps"
+            "CGEvent.tapCreate failed: Accessibility permission is required for event taps"
         }
     }
 

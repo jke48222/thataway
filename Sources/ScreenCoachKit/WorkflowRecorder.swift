@@ -183,7 +183,7 @@ public final class WorkflowRecorder {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d, HH:mm"
         return Lesson(
-            title: "\(appName) — recorded \(formatter.string(from: Date()))",
+            title: "\(appName): recorded \(formatter.string(from: Date()))",
             bundleID: bundleID,
             steps: steps.map(\.step)
         )

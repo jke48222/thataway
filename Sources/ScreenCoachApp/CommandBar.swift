@@ -59,7 +59,7 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
         container.layer?.cornerRadius = 12
         container.layer?.masksToBounds = true
 
-        field.placeholderString = "Name a control — “the Preferences button”"
+        field.placeholderString = "Name a control, like “the Preferences button”"
         field.font = .systemFont(ofSize: 19, weight: .regular)
         field.isBordered = false
         field.drawsBackground = false
