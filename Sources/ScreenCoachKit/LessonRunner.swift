@@ -27,10 +27,28 @@ public final class LessonRunner {
     /// Fires when a step auto-advances, with how long it took the learner.
     public var onAdvance: ((Int, Double) -> Void)?
 
-    /// A step that never completes should not spin forever. After this the
-    /// runner stops watching and lets the user advance by hand — an honest
-    /// "I can't tell" beats a lesson stuck on step 3 with no explanation.
+    /// Why the runner is waiting on the learner to say "next".
+    public enum StallReason: Equatable {
+        /// The step is `.manual`: nothing on screen says when it is done.
+        case manualStep
+        /// The step's completion was not seen within `stepTimeout`.
+        case timedOut
+    }
+
+    /// Fires once per step when the runner cannot advance on its own, so the
+    /// app can say "choose Next Step when you're done" instead of leaving
+    /// the learner under a dimmed screen with no way forward. Call
+    /// `advance()` from the app's Next Step action.
+    public var onStall: ((LessonProgress, Step, StallReason) -> Void)?
+
+    /// A step that never completes should not wait silently forever. After
+    /// this the runner reports a stall — an honest "I can't tell, press Next
+    /// when you're done" beats a lesson stuck on step 3 with no explanation.
+    /// It keeps watching, so a late completion still advances.
     public var stepTimeout: TimeInterval = 120
+
+    /// Whether the learner currently has to advance by hand.
+    public private(set) var isStalled = false
 
     public init(cache: AXCache) {
         self.cache = cache
@@ -39,11 +57,11 @@ public final class LessonRunner {
     public var isRunning: Bool { progress != nil && !(progress?.isFinished ?? true) }
 
     public func start(_ lesson: Lesson) {
-        var p = LessonProgress(lesson: lesson)
+        let p = LessonProgress(lesson: lesson)
         progress = p
         beginCurrentStep()
         onStep?(p, p.current)
-        _ = p   // progress is republished by beginCurrentStep
+        reportManualStall()
         startWatching()
     }
 
@@ -52,6 +70,7 @@ public final class LessonRunner {
         timer = nil
         progress = nil
         stepStartTree = []
+        isStalled = false
     }
 
     /// Manual advance — for `.manual` steps, and for when the learner knows
@@ -68,6 +87,8 @@ public final class LessonRunner {
         }
         beginCurrentStep()
         onStep?(p, p.current)
+        reportManualStall()
+        if timer == nil { startWatching() }
     }
 
     public func back() {
@@ -76,6 +97,8 @@ public final class LessonRunner {
         progress = p
         beginCurrentStep()
         onStep?(p, p.current)
+        reportManualStall()
+        if timer == nil { startWatching() }
     }
 
     // MARK: - Watching
@@ -83,6 +106,13 @@ public final class LessonRunner {
     private func beginCurrentStep() {
         stepStartTree = cache.tree()?.nodes ?? []
         stepStartedAtNs = Mono.nowNs()
+        isStalled = false
+    }
+
+    private func reportManualStall() {
+        guard let p = progress, let step = p.current, step.completion == .manual else { return }
+        isStalled = true
+        onStall?(p, step, .manualStep)
     }
 
     private func startWatching() {
@@ -99,16 +129,22 @@ public final class LessonRunner {
 
     private func tick() {
         guard let p = progress, let rawStep = p.current else { return }
-        guard let tree = cache.tree(), !tree.nodes.isEmpty else { return }
-        let now = tree.nodes
-        let step = rawStep.resolved(appName: tree.appName)
 
         let elapsed = Mono.msSince(stepStartedAtNs)
-        if elapsed > stepTimeout * 1000 {
-            timer?.cancel()
-            timer = nil
-            return
+        if elapsed > stepTimeout * 1000, !isStalled {
+            isStalled = true
+            onStall?(p, rawStep, .timedOut)
         }
+
+        // The cached tree, never a blocking walk: this runs on main four
+        // times a second. The cache already refreshes on the AX events that
+        // accompany "the user did the thing" (values, titles, menus,
+        // elements appearing and going away), so it is current without the
+        // runner paying for a walk — and an app with no window no longer
+        // costs a failed 250 ms walk on every tick.
+        guard let tree = cache.cachedEntry?.snapshot, !tree.nodes.isEmpty else { return }
+        let now = tree.nodes
+        let step = rawStep.resolved(appName: tree.appName)
 
         // A step whose starting tree was empty has nothing to compare against
         // — usually the app was mid-transition. Re-baseline instead of

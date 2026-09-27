@@ -110,6 +110,10 @@ public final class WorkflowRecorder {
     private var pending: (query: String, label: String, before: [AXNode], deadline: DispatchWorkItem)?
     private var appName = ""
     private var bundleID: String?
+    /// True while any menu of this process is open — the status-item menu
+    /// the author stops the recording from, most of all.
+    private var menuTracking = false
+    private var menuObservers: [NSObjectProtocol] = []
 
     public private(set) var isRecording = false
 
@@ -127,6 +131,10 @@ public final class WorkflowRecorder {
         self.cache = cache
     }
 
+    deinit {
+        for o in menuObservers { NotificationCenter.default.removeObserver(o) }
+    }
+
     public func start() throws {
         guard !isRecording else { return }
         steps = []
@@ -134,11 +142,33 @@ public final class WorkflowRecorder {
         let tree = cache.tree()
         appName = tree?.appName ?? "this app"
         bundleID = tree?.bundleID
+        observeMenuTracking()
+        let me = ProcessInfo.processInfo.processIdentifier
         mouse.onClick = { [weak self] point, _ in
-            DispatchQueue.main.async { self?.handleClick(at: point) }
+            // Decided here, on the tap thread, at the moment of the click:
+            // by the time main runs, a menu that was clicked may already
+            // have closed. The coach is an accessory app whose UI (the
+            // status-item menu, the command bar, the overlay) never makes it
+            // frontmost, so "is the coach frontmost" can never recognise a
+            // click on it; "is the point inside one of our windows" can.
+            let onCoach = WindowServer.window(ownedBy: me, contains: point)
+            DispatchQueue.main.async {
+                self?.handleClick(at: point, onCoach: onCoach)
+            }
         }
         try mouse.start()
         isRecording = true
+    }
+
+    private func observeMenuTracking() {
+        guard menuObservers.isEmpty else { return }
+        let center = NotificationCenter.default
+        menuObservers = [
+            center.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil,
+                               queue: .main) { [weak self] _ in self?.menuTracking = true },
+            center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil,
+                               queue: .main) { [weak self] _ in self?.menuTracking = false },
+        ]
     }
 
     /// Stop and produce the lesson. Any pending step is finalized against the
@@ -147,7 +177,7 @@ public final class WorkflowRecorder {
         guard isRecording else { return nil }
         mouse.stop()
         isRecording = false
-        finalizePending(with: cache.tree()?.nodes ?? [])
+        finalizePending(with: cache.refreshNow()?.nodes ?? [])
 
         guard !steps.isEmpty else { return nil }
         let formatter = DateFormatter()
@@ -169,13 +199,14 @@ public final class WorkflowRecorder {
 
     // MARK: - Click handling
 
-    private func handleClick(at point: CGPoint) {
-        // Clicks on the coach itself — the menu bar item, the command bar —
-        // are the author steering the recorder, not part of the workflow.
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier
-            == ProcessInfo.processInfo.processIdentifier {
-            return
-        }
+    private func handleClick(at point: CGPoint, onCoach: Bool) {
+        // A click handled after the recording stopped is not part of it.
+        guard isRecording else { return }
+        // Clicks on the coach itself — the menu bar item, its menu, the
+        // command bar — are the author steering the recorder, not part of
+        // the workflow. The menu may sit over the recorded app's window, so
+        // hit-testing that click against the app's tree would invent a step.
+        if onCoach || menuTracking { return }
 
         guard let tree = cache.tree(), !tree.nodes.isEmpty else {
             onSkipped?("no accessible tree at click time")
@@ -198,7 +229,10 @@ public final class WorkflowRecorder {
 
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.finalizePending(with: self.cache.tree()?.nodes ?? [])
+            // A forced read, not the cache: a click that toggles a checkbox
+            // or opens a menu may not have refreshed it yet, and diffing the
+            // before-tree against itself would record every step as manual.
+            self.finalizePending(with: self.cache.refreshNow()?.nodes ?? [])
         }
         pending = (query, label, tree.nodes, work)
         DispatchQueue.main.asyncAfter(deadline: .now() + settleSeconds, execute: work)
@@ -256,18 +290,63 @@ public final class LessonStore {
         return url
     }
 
+    /// Largest lesson file read. Lessons are a few kilobytes of names; the
+    /// cap exists because they are also meant to be copied from other
+    /// people's Macs, which makes them untrusted input.
+    public var maxLessonBytes = 1_000_000
+
+    private var titleCache: [URL: (modified: Date, size: Int, title: String?)] = [:]
+    private let cacheLock = NSLock()
+
+    /// The saved lessons, by title. Called every time the menu opens, on
+    /// main, so a title is re-parsed only when its file changed.
     public func list() -> [(title: String, url: URL)] {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey,
+                                      .fileSizeKey, .contentModificationDateKey]
         let urls = (try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil
+            at: directory, includingPropertiesForKeys: keys
         )) ?? []
-        return urls
-            .filter { $0.pathExtension == "json" }
-            .compactMap { url in load(url).map { ($0.title, url) } }
-            .sorted { $0.0 < $1.0 }
+        var out: [(title: String, url: URL)] = []
+        var seen = Set<URL>()
+        for url in urls where url.pathExtension == "json" {
+            guard let v = safeAttributes(url) else { continue }
+            seen.insert(url)
+            cacheLock.lock(); let hit = titleCache[url]; cacheLock.unlock()
+            let title: String?
+            if let hit, hit.modified == v.modified, hit.size == v.size {
+                title = hit.title
+            } else {
+                title = load(url)?.title
+                cacheLock.lock(); titleCache[url] = (v.modified, v.size, title); cacheLock.unlock()
+            }
+            if let title { out.append((title, url)) }
+        }
+        cacheLock.lock()
+        titleCache = titleCache.filter { seen.contains($0.key) }
+        cacheLock.unlock()
+        return out.sorted { $0.title < $1.title }
     }
 
+    /// Loads a lesson, refusing anything that is not a plain regular file of
+    /// modest size: a symlink to /dev/zero or a multi-gigabyte file must not
+    /// be able to hang the menu.
     public func load(_ url: URL) -> Lesson? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard safeAttributes(url) != nil,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maxLessonBytes + 1),
+              data.count <= maxLessonBytes else { return nil }
         return try? JSONDecoder().decode(Lesson.self, from: data)
+    }
+
+    private func safeAttributes(_ url: URL) -> (modified: Date, size: Int)? {
+        var url = url
+        url.removeAllCachedResourceValues()
+        guard let v = try? url.resourceValues(forKeys: [
+            .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey,
+        ]) else { return nil }
+        guard v.isSymbolicLink != true, v.isRegularFile == true,
+              let size = v.fileSize, size <= maxLessonBytes else { return nil }
+        return (v.contentModificationDate ?? .distantPast, size)
     }
 }
