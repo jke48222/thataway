@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// Multi-step teaching, and knowing when a step is actually done.
@@ -108,12 +109,16 @@ public enum LessonEngine {
                 && !resolves(query, in: after, windowBounds, threshold)
 
         case .valueChanges(let query):
+            // "Change the value" means the value. Geometry is not evidence
+            // here at all: a field that moved did not get typed into.
             return changed(query, before: before, after: after,
-                           windowBounds: windowBounds, threshold: threshold)
+                           windowBounds: windowBounds, threshold: threshold,
+                           countMovement: false)
 
         case .targetChanges:
             return changed(target, before: before, after: after,
-                           windowBounds: windowBounds, threshold: threshold)
+                           windowBounds: windowBounds, threshold: threshold,
+                           countMovement: true)
         }
     }
 
@@ -139,10 +144,19 @@ public enum LessonEngine {
     }
 
     /// Did the element this query names change in a way a person would call
-    /// "I did it"? Value first, then enabled state, then its own bounds —
-    /// a control that moved is usually a panel that opened around it.
+    /// "I did it"? Value first, then enabled state, then — only when
+    /// `countMovement` is set — its position *within the window*: a control
+    /// that moved inside an unchanged window is usually a panel that opened
+    /// around it.
+    ///
+    /// Absolute bounds are not evidence of anything the learner did. Dragging
+    /// the window translates every node, and the cache re-reads on
+    /// `kAXWindowMovedNotification`, so comparing raw CG rects made any
+    /// window move complete the step. Resizing reflows anchored controls, so
+    /// a change in the window's own size disqualifies movement too.
     static func changed(_ query: String, before: [AXNode], after: [AXNode],
-                        windowBounds: ScreenRect?, threshold: Double) -> Bool {
+                        windowBounds: ScreenRect?, threshold: Double,
+                        countMovement: Bool) -> Bool {
         guard let b = AXResolver.rank(query: query, in: before,
                                       windowBounds: windowBounds, limit: 1).first,
               let a = AXResolver.rank(query: query, in: after,
@@ -151,8 +165,36 @@ public enum LessonEngine {
         else { return false }
         if b.node.valueText != a.node.valueText { return true }
         if b.node.enabled != a.node.enabled { return true }
-        if b.node.bounds.cg != a.node.bounds.cg { return true }
+        if countMovement,
+           movedWithinWindow(b.node, in: before, a.node, in: after) { return true }
         return false
+    }
+
+    /// Sub-point differences are rounding between the backing scale and
+    /// points, not movement.
+    static let movementTolerance: CGFloat = 1
+
+    /// Did `node` move relative to the tree it belongs to, with the tree's
+    /// own extent the same size? The extent is the union of every node's
+    /// bounds — the same reference the app points against, and one that
+    /// includes the AXWindow root the tree walk always records.
+    static func movedWithinWindow(_ nodeBefore: AXNode, in before: [AXNode],
+                                  _ nodeAfter: AXNode, in after: [AXNode]) -> Bool {
+        let eb = extent(of: before), ea = extent(of: after)
+        guard !eb.isNull, !ea.isNull else { return false }
+        let tol = movementTolerance
+        // The window was resized (or something grew it): anchored controls
+        // reflow on their own, so movement is not attributable to the user.
+        guard abs(eb.width - ea.width) <= tol, abs(eb.height - ea.height) <= tol
+        else { return false }
+        let rb = nodeBefore.bounds.cg.offsetBy(dx: -eb.minX, dy: -eb.minY)
+        let ra = nodeAfter.bounds.cg.offsetBy(dx: -ea.minX, dy: -ea.minY)
+        return abs(rb.minX - ra.minX) > tol || abs(rb.minY - ra.minY) > tol
+            || abs(rb.width - ra.width) > tol || abs(rb.height - ra.height) > tol
+    }
+
+    static func extent(of nodes: [AXNode]) -> CGRect {
+        nodes.reduce(CGRect.null) { $0.union($1.bounds.cg) }
     }
 }
 

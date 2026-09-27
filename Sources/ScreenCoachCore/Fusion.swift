@@ -48,13 +48,17 @@ public enum Fusion {
     public enum Source: String, Equatable {
         /// Accessibility tree alone, above threshold. Exact.
         case accessibility
-        /// Vision alone. Never confident — 58% on dense UIs is a coin flip
-        /// with a lean, and presenting that as fact is the failure mode this
-        /// project exists to fix.
+        /// Vision's answer: either the tree had no candidate at all, or its
+        /// best candidate was below the hit threshold and vision pointed
+        /// elsewhere. Never confident — 58% on dense UIs is a coin flip with a
+        /// lean, and presenting that as fact is the failure mode this project
+        /// exists to fix.
         case vision
         /// Both agreed. The strongest signal available.
         case corroborated
-        /// Both answered and pointed at different things.
+        /// Both answered and pointed at different things, and the tree's
+        /// answer was strong enough (at or above the hit threshold) to keep
+        /// the pointer.
         case conflicted
     }
 
@@ -137,19 +141,47 @@ public enum Fusion {
                     label: a.label, explanation: nil
                 )
             }
-            // They disagree by more than the element's own bounds. Say so.
-            //
-            // The AX rect is still what gets pointed at: when the element
-            // exists its geometry is exact, and the vision model is the one
-            // with a 42% error rate. But the ring goes dashed, because the
-            // corroboration that would have justified a solid one is absent.
+            // They disagree by more than the element's own bounds. Say so —
+            // and which answer gets the pointer depends on how good the
+            // tree's answer was. A gap in points is meaningless across
+            // monitors, so that case is named rather than measured.
+            let sameScreen = a.bounds.screenIndex == v.point.screenIndex
+            let gap = distance(from: v.point.cg, to: a.bounds.cg)
+
+            if a.score >= axHitThreshold {
+                // A strong tree match: when the element exists its geometry
+                // is exact, and the vision model is the one with a 42% error
+                // rate, so the tree keeps the pointer. But the ring goes
+                // dashed, because the corroboration that would have justified
+                // a solid one is absent.
+                return Decision(
+                    target: a.bounds, confidence: .uncertain, source: .conflicted,
+                    label: a.label,
+                    explanation: sameScreen
+                        ? String(format: "the accessibility tree and the vision model disagree "
+                                       + "by %.0f pt — pointing at the tree's answer", gap)
+                        : "the accessibility tree and the vision model point at different "
+                        + "displays — pointing at the tree's answer"
+                )
+            }
+
+            // A weak tree match is the case the fallback exists for: vision
+            // only runs when the tree's best answer fell below the bar, and
+            // `rank` returns *something* for almost any query on a real tree —
+            // one shared word is enough. Letting that below-threshold guess
+            // overrule the model we just spent seconds running would make the
+            // fallback decorative. The model's point gets the (dashed) ring,
+            // and the explanation names the tree candidate it beat, so the
+            // disagreement is still stated rather than hidden.
             return Decision(
-                target: a.bounds, confidence: .uncertain, source: .conflicted,
-                label: a.label,
-                explanation: String(
-                    format: "the accessibility tree and the vision model disagree "
-                          + "by %.0f pt — pointing at the tree's answer",
-                    distance(from: v.point.cg, to: a.bounds.cg))
+                target: ring(around: v.point), confidence: .uncertain, source: .vision,
+                label: "best visual guess",
+                explanation: "the accessibility tree's closest match (“\(a.label)”, only "
+                           + String(format: "%.0f%% sure) ", a.score * 100)
+                           + (sameScreen
+                              ? String(format: "is %.0f pt from the vision model's answer", gap)
+                              : "is on a different display from the vision model's answer")
+                           + " — pointing at the vision model's guess"
             )
 
         case (.none, .none):

@@ -117,27 +117,84 @@ public struct ExclusionList: Equatable, Sendable {
     /// reviewed in a diff. A privacy control the user cannot read is not one.
     ///
     ///     # comment
-    ///     bundle: com.example.bank
+    ///     bundle: com.example.bank    # a trailing comment is fine
     ///     title: online banking
+    ///
+    /// A `#` at the start of a line, or after whitespace, starts a comment.
+    /// Trailing notes are the natural thing to write next to a rule, and
+    /// before this was handled a line like `bundle: com.chase  # bank` kept
+    /// the note as part of the pattern — a rule that could never match, in a
+    /// file that still had other rules, so the fail-closed fallback to the
+    /// defaults never kicked in and the app was quietly read and captured.
     public static func parse(_ text: String) -> ExclusionList {
+        parseReport(text).list
+    }
+
+    /// Something in the file that was not taken literally, for the store to
+    /// log or show. A privacy rule that silently does something other than
+    /// what it says is worse than one that is rejected out loud.
+    public struct ParseIssue: Equatable, Sendable {
+        /// 1-based, as an editor shows it.
+        public let line: Int
+        public let text: String
+        public let message: String
+    }
+
+    public static func parseReport(_ text: String) -> (list: ExclusionList, issues: [ParseIssue]) {
         var rules: [Rule] = []
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
-            let parts = line.split(separator: ":", maxSplits: 1).map {
+        var issues: [ParseIssue] = []
+        for (i, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false)
+            .enumerated() {
+            let raw = String(rawLine)
+            let line = stripComment(raw).trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            func note(_ message: String) {
+                issues.append(ParseIssue(line: i + 1,
+                                         text: raw.trimmingCharacters(in: .whitespaces),
+                                         message: message))
+            }
+            let parts = line.split(separator: ":", maxSplits: 1,
+                                   omittingEmptySubsequences: false).map {
                 $0.trimmingCharacters(in: .whitespaces)
             }
-            guard parts.count == 2, !parts[1].isEmpty else { continue }
+            guard parts.count == 2 else {
+                note("not a rule — expected “bundle: …” or “title: …”"); continue
+            }
+            guard !parts[1].isEmpty else { note("rule has no pattern — ignored"); continue }
             switch parts[0].lowercased() {
             case "bundle", "bundleid", "app":
-                rules.append(Rule(kind: .bundleID, pattern: parts[1]))
+                // Bundle IDs never contain whitespace, so anything after the
+                // first token is a note the user forgot to mark with `#`.
+                // Keeping the ID and dropping the note is the reading that
+                // excludes what they meant to exclude.
+                let tokens = parts[1].split(whereSeparator: { $0 == " " || $0 == "\t" })
+                let id = String(tokens[0])
+                if tokens.count > 1 {
+                    note("bundle IDs contain no spaces — using “\(id)” and ignoring the rest")
+                }
+                rules.append(Rule(kind: .bundleID, pattern: id))
             case "title":
                 rules.append(Rule(kind: .titleContains, pattern: parts[1]))
             default:
-                continue
+                note("unknown rule kind “\(parts[0])” — ignored")
             }
         }
-        return ExclusionList(rules: rules)
+        return (ExclusionList(rules: rules), issues)
+    }
+
+    /// Everything from the first `#` that begins the line or follows
+    /// whitespace is a comment. A `#` inside a word (`title: issue#12`) is
+    /// kept, so the only titles this can shorten are ones with a spaced `#`,
+    /// and shortening a title pattern only ever widens what it excludes.
+    static func stripComment(_ line: String) -> String {
+        var previous: Character? = nil
+        var kept = ""
+        for ch in line {
+            if ch == "#", previous == nil || previous!.isWhitespace { break }
+            kept.append(ch)
+            previous = ch
+        }
+        return kept
     }
 
     public func serialized() -> String {
@@ -146,8 +203,10 @@ public struct ExclusionList: Equatable, Sendable {
             "# The coach never captures a frame from anything matching these.",
             "# Checked before capture, not after. Edits apply immediately.",
             "#",
-            "#   bundle: com.example.bank     matches the app and its helpers",
-            "#   title:  online banking       matches any window whose title contains it",
+            "# One rule per line. Anything after a # is a comment.",
+            "#",
+            "#   bundle: com.example.bank     # the app and its helpers",
+            "#   title: online banking        # any window whose title contains it",
             "",
         ]
         for rule in rules {

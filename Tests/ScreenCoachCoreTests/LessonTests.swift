@@ -17,9 +17,13 @@ final class LessonTests: XCTestCase {
                bounds: ScreenRect(cg: rect, screenIndex: 0))
     }
 
+    /// Real trees always carry their AXWindow root (the tree walk starts
+    /// there), so the fixtures do too — the window is what movement is
+    /// measured against.
     private var closed: [AXNode] {
         [node(0, role: "AXButton", title: "Preferences"),
-         node(1, role: "AXCheckBox", title: "Metronome", value: "0")]
+         node(1, role: "AXCheckBox", title: "Metronome", value: "0"),
+         node(9, role: "AXWindow", title: "Untitled", rect: window.cg)]
     }
 
     private var opened: [AXNode] {
@@ -93,6 +97,82 @@ final class LessonTests: XCTestCase {
         XCTAssertTrue(LessonEngine.isSatisfied(
             .targetChanges, target: "the Preferences button",
             before: closed, after: after, windowBounds: window))
+    }
+
+    // MARK: - The window moving is not the learner doing the step
+
+    /// Every node, window included, shifted by the same amount.
+    private func translated(_ nodes: [AXNode], dx: CGFloat, dy: CGFloat) -> [AXNode] {
+        nodes.map { n in
+            AXNode(id: n.id, parentID: n.parentID, depth: n.depth, role: n.role,
+                   title: n.title, valueText: n.valueText, enabled: n.enabled,
+                   bounds: ScreenRect(cg: n.bounds.cg.offsetBy(dx: dx, dy: dy),
+                                      screenIndex: n.bounds.screenIndex))
+        }
+    }
+
+    private var searchTree: [AXNode] {
+        [node(0, role: "AXTextField", title: "Search", value: "",
+              rect: CGRect(x: 20, y: 20, width: 200, height: 24)),
+         node(1, role: "AXCheckBox", title: "Wrap lines", value: "0",
+              rect: CGRect(x: 20, y: 60, width: 120, height: 20)),
+         node(9, role: "AXWindow", title: "Find", rect: window.cg)]
+    }
+
+    /// The audit's probe: drag the window during "Type what you're looking
+    /// for" and the step used to finish on its own.
+    func testMovingTheWindowDoesNotCompleteAValueStep() {
+        let moved = translated(searchTree, dx: 150, dy: 40)
+        XCTAssertFalse(LessonEngine.isSatisfied(
+            .valueChanges("the search field"), target: "the search field",
+            before: searchTree, after: moved))
+    }
+
+    func testMovingTheWindowDoesNotCompleteATargetStep() {
+        let moved = translated(searchTree, dx: 150, dy: 40)
+        XCTAssertFalse(LessonEngine.isSatisfied(
+            .targetChanges, target: "the Wrap lines checkbox",
+            before: searchTree, after: moved))
+    }
+
+    /// Resizing reflows anchored controls without the learner touching them.
+    func testResizingTheWindowDoesNotCompleteATargetStep() {
+        var resized = searchTree
+        resized[0] = node(0, role: "AXTextField", title: "Search", value: "",
+                          rect: CGRect(x: 20, y: 20, width: 400, height: 24))
+        resized[1] = node(1, role: "AXCheckBox", title: "Wrap lines", value: "0",
+                          rect: CGRect(x: 220, y: 60, width: 120, height: 20))
+        resized[2] = node(9, role: "AXWindow", title: "Find",
+                          rect: CGRect(x: 0, y: 0, width: 1200, height: 800))
+        XCTAssertFalse(LessonEngine.isSatisfied(
+            .targetChanges, target: "the Wrap lines checkbox",
+            before: searchTree, after: resized))
+        XCTAssertFalse(LessonEngine.isSatisfied(
+            .valueChanges("the search field"), target: "the search field",
+            before: searchTree, after: resized))
+    }
+
+    /// Moving the window must not mask the real thing either.
+    func testTypingInAMovedWindowStillCompletes() {
+        var after = translated(searchTree, dx: 150, dy: 40)
+        let f = after[0]
+        after[0] = AXNode(id: f.id, parentID: f.parentID, depth: f.depth, role: f.role,
+                          title: f.title, valueText: "needle", enabled: f.enabled,
+                          bounds: f.bounds)
+        XCTAssertTrue(LessonEngine.isSatisfied(
+            .valueChanges("the search field"), target: "the search field",
+            before: searchTree, after: after))
+    }
+
+    /// A value step asks about the value; the field moving inside the window
+    /// is not typing into it.
+    func testMovementAloneDoesNotCompleteAValueStep() {
+        var after = searchTree
+        after[0] = node(0, role: "AXTextField", title: "Search", value: "",
+                        rect: CGRect(x: 300, y: 200, width: 200, height: 24))
+        XCTAssertFalse(LessonEngine.isSatisfied(
+            .valueChanges("the search field"), target: "the search field",
+            before: searchTree, after: after))
     }
 
     func testUnresolvableTargetNeverCompletes() {
