@@ -104,7 +104,7 @@ them is not a measurement at all.
 | --- | --- | --- |
 | Resolver latency | **0.067 ms p50, 0.081 ms p90** | `bench-data/axplan-chrome.json`, same run as the accuracy below |
 | Resolver accuracy | **12 of 12 on a Google Chrome window** | Same file, `ax_hit_rate: 1` over 12 plans |
-| Unit tests | **96 passing, 0 failures** | `swift test`, run 2026-08-27 |
+| Unit tests | **156 passing, 0 failures** | `swift test`, run 2026-09-27: 122 core, 28 Kit, 6 bench |
 | Source size | 8,381 lines across 34 Swift files | Sources 7,261, Tests 1,075, Package.swift 45 |
 
 **On the source size:** the figure only clears 8,300 if you count the tests. The application and
@@ -231,15 +231,19 @@ hypothetical.
 
 The fix has a property worth spelling out.
 [`AXCache.swift`](Sources/ScreenCoachKit/AXCache.swift) checks the exclusion rules **before the
-first accessibility call**, on the bundle identifier alone. Title-pattern rules need a window
-title, and reading a title through the accessibility API would mean reading the app you are trying
-not to read, so the title comes from `CGWindowList` instead. **Testing whether an app is excluded
-therefore never requires touching it through the accessibility API.**
+first accessibility call**, on the bundle identifier alone. **An app excluded by bundle is never
+touched through the accessibility API.** Title-pattern rules need a window title, which comes from
+`CGWindowList` first. macOS withholds other apps' window titles without Screen Recording
+permission, and failing open on a missing title would make every title rule inert. So for an app
+whose bundle is allowed, the cache also reads the focused window's `AXTitle` (at most three
+attribute reads, no tree walk) and checks it before walking. A tree whose own window title
+matches a rule is discarded before it is cached or served.
 
 [`ExclusionStore.swift`](Sources/ScreenCoachKit/ExclusionStore.swift) keeps the list at
 `~/.config/screencoach/exclusions.conf` as plain text, seeds it on first run so you can read what
-is excluded rather than trust a claim, fails closed (an empty or unparseable file falls back to
-defaults, never to "allow everything"), and hot reloads on save. It re-arms its file watch after a
+is excluded rather than trust a claim, and hot reloads on save. It fails closed: a file with no
+rules means the defaults, never "allow everything", and a file caught mid-save or unreadable keeps
+the rules already loaded. It re-arms its file watch after a
 delete or rename, because editors replace files rather than writing in place and the watch would
 otherwise die after the first save.
 
@@ -257,23 +261,27 @@ recognition runs on device and the app refuses rather than sending audio to a se
 
 `ScreenCoachCore` imports only Foundation, CoreGraphics and Darwin. **No AppKit, no
 ApplicationServices, no ScreenCaptureKit.** That is enforced by what the module is allowed to
-contain rather than by convention, and it is why 96 tests run in nine milliseconds with no
-permissions, no windows and no hardware.
+contain rather than by convention, and it is why its 122 tests run in about fifteen milliseconds
+with no permissions, no windows and no hardware.
 
 The parts most likely to be silently wrong live there deliberately: the multi-display coordinate
 conversion, the latency budget arithmetic, the resolver's scoring, and the fusion rules.
 
 | Test file | Count | What it covers |
 | --- | ---: | --- |
-| `FusionTests` | 24 | Combining tree and vision candidates, and the confidence rules |
-| `LessonTests` | 17 | Steps, completion conditions, tree-diff detection |
+| `FusionTests` | 34 | Combining tree and vision candidates, the confidence rules, exclusion parsing |
+| `LessonTests` | 22 | Steps, completion conditions, tree-diff detection |
 | `WorkflowInferenceTests` | 16 | Click hit-testing and turning clicks into semantic steps |
 | `LatencyTests` | 15 | Stage timing, percentiles, the budget as code |
 | `AXResolverTests` | 13 | Query to element ranking, and crop aiming on a miss |
 | `DisplaySpaceTests` | 11 | The multi-display coordinate trap, at the type level |
+| `PushToTalkTests` | 11 | Hold versus tap on hardware timestamps, and turn ordering |
 
-The system-facing half (`ScreenCoachKit`) and the app itself have no unit tests. That is the real
-coverage gap.
+`ScreenCoachKit` has 28 tests for what runs without a display or a permission: the hotkey state
+machine, the capture exclusion plan, cache freshness, exclusion file reloads, lesson file limits,
+and the vision sidecar protocol against a stand-in Python script. Six more cover the bench CLI's
+`axplan` flags. The accessibility walk, capture, overlay drawing, voice and the app's turn logic
+have no unit tests. That is the real coverage gap.
 
 ## Running it
 
@@ -282,7 +290,7 @@ Swift dependencies.
 
 ```bash
 swift build -c release
-swift test                                  # 96 tests, headless, no permissions needed
+swift test                                  # 156 tests, headless, no permissions needed
 ./.build/release/screencoach-bench doctor    # environment and permission preflight
 ```
 
@@ -305,8 +313,14 @@ Reproduce the measurements:
 ./.build/release/screencoach-bench coldwarm --app "Logic Pro" --deadline 2000   # Finding 1
 ./.build/release/screencoach-bench ax                                          # Finding 2
 ./.build/release/screencoach-bench capture --scope window                       # Finding 4
-./.build/release/screencoach-bench axplan                                       # the 0.067 ms number
 ./.build/release/screencoach-bench budget                                       # exits non-zero on violation
+```
+
+The 0.067 ms resolver number needs no permissions, because it reads the committed Chrome snapshot:
+
+```bash
+./.build/release/screencoach-bench axplan --data bench-data/google-chrome.json --targets 12 \
+  --out bench-data/axplan-chrome.json
 ```
 
 Test the whole turn without a human:
@@ -343,14 +357,16 @@ Sources/
 │   ├── ScreenGrab.swift        Display capture with origin, scale and index
 │   ├── GroundingService.swift  The vision sidecar, started lazily on the first miss
 │   ├── Overlay.swift           All-Spaces click-through panel, bezier-arc pointer
-│   ├── HotKeyTap.swift         Listen-only event tap on its own thread
+│   ├── HotKeyTap.swift         Event tap on its own thread, swallows only the hotkey
 │   ├── Voice.swift             On-device push-to-talk speech, and speech out
 │   ├── LessonRunner.swift      Multi-step teaching with evidence-driven advance
 │   └── WorkflowRecorder.swift  "Watch me": clicks to steps to JSON on disk
 ├── ScreenCoachApp/        Menu bar app, hotkey, command bar, the resolve and point turn
 └── ScreenCoachBench/      screencoach-bench, 14 subcommands, every number in the findings
 
-Tests/ScreenCoachCoreTests/  96 tests, headless
+Tests/ScreenCoachCoreTests/  122 tests, headless
+Tests/ScreenCoachKitTests/   28 tests, headless, no permissions
+Tests/ScreenCoachBenchTests/ 6 tests of the bench CLI's flags
 Tools/                       The Python vision harnesses and the app packaging script
 bench-data/                  Committed benchmark output, the source of every figure above
 PHASE-0-FINDINGS.md          The engineering log, 23 findings across phases 0 to 4
@@ -362,16 +378,16 @@ PHASE-0-FINDINGS.md          The engineering log, 23 findings across phases 0 to
 push-to-talk voice, the privacy gate, the vision fallback with aimed crops, fusion with rendered
 confidence, and multi-step lessons. The app builds, launches and points.
 
-Shipping state: `build/ScreenCoach.app`, thin arm64, bundle `com.funproject.screencoach`, version
-0.1.0, a menu bar only app (`LSUIElement`), signed with an Apple Development certificate.
+Shipping state: built locally by `bash Tools/make-app.sh` into `build/ScreenCoach.app`, which is
+not committed. Thin arm64, bundle `com.funproject.screencoach`, version 0.1.0, a menu bar only app
+(`LSUIElement`), signed with an Apple Development identity.
 
 **Not done, stated plainly:**
 
-- **This project is not in version control.** There is no git repository, no history and no
-  backup. 8,381 lines of Swift, a 1,066 line engineering log and every benchmark artifact exist
-  on exactly one machine. This is the first thing to fix.
-- **There is no CI**, so the latency budget gate is CI-ready rather than gating anything.
-  `screencoach-bench budget` exits non-zero correctly, and nothing runs it automatically.
+- **CI cannot gate the latency budget.** [CI](.github/workflows/ci.yml) builds release, runs the
+  unit tests and reproduces the `axplan` resolver result, but `screencoach-bench budget` needs
+  Accessibility and a live app to measure, and a hosted runner has neither. It exits non-zero
+  correctly, and only a local run exercises it.
 - **Idle CPU and memory are unmeasured.** The harness exists at
   [`App.swift`](Sources/ScreenCoachApp/App.swift) (`--idlebench`, `getrusage` for CPU over a
   settled idle window, `task_info` for resident memory) and it prints to standard output, but **no
@@ -379,12 +395,16 @@ Shipping state: `build/ScreenCoach.app`, thin arm64, bundle `com.funproject.scre
   comparison worth making is with the sibling WindowPet project, which publishes a generated
   `ENERGY.md` with per-phase budgets. This project has the harness and not the number, and the
   findings document's own principle applies: an unmeasured stage is not a met budget.
-- **The packaged app cannot run the vision path.** `Contents/Resources/` is empty and
-  `Tools/make-app.sh` never copies `Tools/`, so the bundled app only finds the Python sidecar when
-  it happens to be running beside its own source tree.
+- **The vision path needs things the bundle does not carry.** `Tools/make-app.sh` copies the
+  sidecar (`holo_server.py`, `holo_bench.py`) into `Contents/Resources/Tools`, but the 5.6 GB
+  checkpoint must be at `~/models/holo1.5-7b-4bit` and a Python with `mlx_vlm` and Pillow must be
+  installed. The app looks for one in `SCREENCOACH_PYTHON`, the `pythonPath` default, a `.venv`
+  beside the model, then the usual install locations.
 - **Not notarized**, and the build has no hardened runtime, because the signing script fell back
   from Developer ID to an Apple Development identity. Gatekeeper will reject it on another Mac.
-- **`ScreenCoachKit` and the app have no unit tests.** All 96 are against the pure core.
+- **The system-facing code is mostly untested.** Kit's 28 tests cover its policies and its
+  file and process plumbing; the accessibility walk, capture, overlay, voice and the app's turn
+  logic are checked by hand and by the `--selftest` harness only.
 - **Every headline accuracy figure comes from one Chrome window with twelve targets.** A second
   app, ideally a dense one, is the highest-value next measurement.
 - **No screenshot or demo clip exists.** For a project whose entire output is a cursor arcing to a

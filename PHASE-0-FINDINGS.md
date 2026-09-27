@@ -470,7 +470,8 @@ python3 Tools/holo_sweep.py --data bench-data/logic-pro.json --targets 10
 ```
 
 ```bash
-./.build/release/screencoach-bench axplan --data bench-data/google-chrome.json --targets 12
+./.build/release/screencoach-bench axplan --data bench-data/google-chrome.json --targets 12 \
+  --out bench-data/axplan-chrome.json
 ```
 
 ```bash
@@ -664,7 +665,7 @@ degrade to accessibility-only rather than breaking.
 ## Fusion, and what earns a solid ring
 
 Agreement between two independent methods is the only thing that earns
-confidence. 16 tests pin the policy:
+confidence. 20 tests pin the policy:
 
 | tree | vision | result |
 |---|---|---|
@@ -672,12 +673,14 @@ confidence. 16 tests pin the policy:
 | weak | not run | uncertain, with the reason |
 | none | answered | **uncertain — always**, 58% is not a fact |
 | any | agrees (click inside the element) | **exact — corroborated** |
-| strong | disagrees | **uncertain**, points at the tree, states the gap in points |
+| strong (at or above 0.62) | disagrees | **uncertain**, points at the tree, states the gap in points |
+| weak (below 0.62) | disagrees | **uncertain**, points at vision's guess, names the tree candidate it overruled |
 | strong, screen 0 | same coords, screen 1 | conflicted, never agreement |
 
 Corroboration outranks either path alone: a *weak* AX match that vision
 independently lands inside is promoted to exact, while a strong AX match that
-vision contradicts is demoted to dashed.
+vision contradicts is demoted to dashed. A weak tree match never overrules the
+vision model it triggered.
 
 ## Live reload, verified rather than asserted
 
