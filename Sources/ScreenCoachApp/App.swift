@@ -31,12 +31,77 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
     private let lessonStore = LessonStore()
     private var teachSubmenu: NSMenu?
     private var recordItem: NSMenuItem?
-    /// When the hold began, so a quick tap can be told from a spoken hold.
-    private var holdStartedNs: UInt64 = 0
-    private var spokeThisTurn = false
+    private var visionStatusItem: NSMenuItem?
+    private var privacyStatusItem: NSMenuItem?
+    /// Set on the first vision attempt. The sidecar is only looked at (and
+    /// only shut down) once something has asked for it.
+    private var visionUsed = false
+    /// Hold versus tap, classified on the event tap's hardware timestamps.
+    private var ptt = PushToTalk()
+    /// Ends a hold whose key-up never arrives, so the microphone is bounded.
+    private var holdExpiry: DispatchWorkItem?
+    /// Whether the recogniser produced any words during the current hold.
+    private var heardThisHold = false
+    /// The turn the microphone was opened for. Transcripts from any other
+    /// turn are dropped rather than typed into, or acted on in, a newer one.
+    private var listeningTurn: UInt64 = 0
+    /// Asked once per launch, and only from a bundle that carries the usage
+    /// strings — asking without them is a TCC crash, not a prompt.
+    private var voicePermissionAsked = false
+    private var accessibilityPromptOffered = false
+
+    /// Every turn advances this; late work checks it before touching the
+    /// screen. See `TurnClock`.
+    private let turns = TurnClock()
     /// Vision runs off the main thread and strictly serially — one 5.6 GB
     /// model, one query at a time.
     private let visionQueue = DispatchQueue(label: "coach.vision", qos: .userInitiated)
+    /// The one queued vision request. A newer query cancels it, so a run of
+    /// misses cannot stack up several multi-second jobs behind the model.
+    private var pendingVision: DispatchWorkItem?
+
+    /// A one-shot answer is on screen. While it is, the lesson layer waits;
+    /// when it ends, the lesson layer is restored rather than everything
+    /// being ordered out.
+    private var oneShotVisible = false
+    /// The one-shot answer on screen is a provisional "checking…" waiting on
+    /// vision.
+    private var provisionalVisible = false
+    private var oneShotEnd: DispatchWorkItem?
+
+    /// The lesson step as last drawn, so the step is redrawn whenever its
+    /// target moves, reappears, or the overlay was cleared — and only then.
+    private struct LessonFrame: Equatable {
+        let stepNumber: Int
+        let rect: ScreenRect
+        let confident: Bool
+
+        func matches(_ other: LessonFrame) -> Bool {
+            stepNumber == other.stepNumber && confident == other.confident
+                && rect.screenIndex == other.rect.screenIndex
+                && abs(rect.cg.minX - other.rect.cg.minX) < 1
+                && abs(rect.cg.minY - other.rect.cg.minY) < 1
+                && abs(rect.cg.width - other.rect.cg.width) < 1
+                && abs(rect.cg.height - other.rect.cg.height) < 1
+        }
+    }
+    private var lessonDrawn: LessonFrame?
+    private var lessonWaitingForTarget = false
+    private var lessonRenderTimer: DispatchSourceTimer?
+    private var spokenStepKey: String?
+
+    /// Short progress text in the menu bar, for states where the command bar
+    /// is deliberately not on screen (vision running, a lesson step waiting
+    /// for its target). The owner lets one clear its own text only.
+    private enum ActivityOwner { case vision, lesson }
+    private var activityOwner: ActivityOwner?
+
+    /// How long a one-shot answer stays up.
+    private static let answerSeconds: TimeInterval = 4.5
+    /// How long a provisional answer may wait for vision before it is taken
+    /// down anyway. First model load can take minutes; a pointer left up
+    /// that long with no context is worse than none.
+    private static let provisionalSeconds: TimeInterval = 60
     private lazy var grounding = GroundingService(
         serverScript: Self.toolsDirectory.appendingPathComponent("holo_server.py"),
         modelPath: FileManager.default.homeDirectoryForCurrentUser
@@ -85,20 +150,22 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             return
         }
 
+        // The privacy gate goes in before anything can read a tree — the
+        // menu's "Point at Something…" works before Accessibility is granted
+        // and before the cache starts, and it must not be an ungated path.
+        wirePrivacyGate()
         buildStatusItem()
         overlay.rebuildForCurrentDisplays()
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main
-        ) { [weak self] _ in self?.overlay.rebuildForCurrentDisplays() }
+        ) { [weak self] _ in self?.displaysChanged() }
 
         commandBar.onQueryChanged = { [weak self] q in self?.preview(q) }
-        commandBar.onSubmit = { [weak self] q in self?.resolveAndPoint(q) }
-        commandBar.onCancel = { [weak self] in
-            self?.commandBar.dismiss()
-            self?.overlay.hide()
-        }
+        commandBar.onSubmit = { [weak self] q in self?.resolveAndPoint(q, spoken: false) }
+        // Escape, and clicking away from the bar, end the turn the same way.
+        commandBar.onCancel = { [weak self] in self?.cancelTurn() }
 
         guard AXExtractor.isTrusted else {
             promptForAccessibility()
@@ -107,29 +174,88 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         startServices()
     }
 
-    private func startServices() {
-        // Wire the privacy gate in before the cache ever runs, so no excluded
-        // app is ever read even once.
+    /// Stop the vision sidecar with the app, so a 5.6 GB model is not left
+    /// resident after Quit.
+    func applicationWillTerminate(_ notification: Notification) {
+        if visionUsed { grounding.shutdown() }
+    }
+
+    private func wirePrivacyGate() {
         cache.exclusionCheck = { [weak self] bundleID, title in
             guard let self else { return nil }
             let v = self.exclusions.check(bundleID: bundleID, windowTitle: title)
             return v.excluded ? (v.reason ?? "excluded") : nil
         }
+        // A warm tree is served for up to five seconds without re-asking the
+        // gate, so a rule change must drop it now, not at the next heartbeat.
+        exclusions.onChange = { [weak self] _ in
+            DispatchQueue.main.async { self?.privacyRulesChanged() }
+        }
+    }
+
+    private var servicesStarted = false
+
+    private func startServices() {
+        guard !servicesStarted else { return }
+        servicesStarted = true
         cache.start()
         wireVoice()
         wireLessons()
 
         let tap = HotKeyTap(binding: .optionSpace)
         tap.onHotKey = { [weak self] eventNs in
-            DispatchQueue.main.async { self?.summon(at: eventNs) }
+            DispatchQueue.main.async { self?.summon(at: eventNs, listen: true) }
         }
-        tap.onHotKeyUp = { [weak self] _ in
-            DispatchQueue.main.async { self?.releaseHold() }
+        // The key-up's own hardware timestamp, not "whenever main gets to
+        // it": main may have been busy with a cold tree read for the whole
+        // hold, and the hold's length is the tap-versus-speak decision.
+        tap.onHotKeyUp = { [weak self] upNs in
+            DispatchQueue.main.async { self?.releaseHold(at: upNs) }
         }
         do { try tap.start() } catch {
             NSLog("ScreenCoach: hotkey tap failed — \(error)")
         }
         hotkey = tap
+
+        // Ask for Speech and Microphone now, up front. Nothing else ever
+        // moves them out of "not determined", and until they are asked the
+        // system does not even list the app in Privacy settings — so a hold
+        // would stay silent forever.
+        requestVoicePermissionsIfUndetermined()
+    }
+
+    // MARK: - Invalidation
+
+    /// Screen geometry changed: the overlay's panels, the tree's CG
+    /// coordinates, and its screen indices are all from the old arrangement.
+    private func displaysChanged() {
+        overlay.rebuildForCurrentDisplays()
+        // Rebuilding discarded every pointer, including a one-shot answer.
+        oneShotEnd?.cancel()
+        oneShotEnd = nil
+        oneShotVisible = false
+        provisionalVisible = false
+        // Making another display primary moves the CG origin without moving
+        // any window, so no AX event fires; drop the cached tree and re-read
+        // so indices and rects are attributed against the new arrangement.
+        cache.invalidate()
+        if servicesStarted { cache.refreshNow() }
+        lessonDrawn = nil
+        renderLesson()
+    }
+
+    /// The exclusion list changed on disk.
+    private func privacyRulesChanged() {
+        // Drop the cached tree first, whether or not the services are
+        // running: the menu's "Point at Something…" can have read one.
+        cache.invalidate()
+        guard servicesStarted else { return }
+        // Re-read through the gate: a newly excluded frontmost app's tree is
+        // dropped here rather than served warm for up to five more seconds.
+        cache.refreshNow()
+        if commandBar.isVisible { preview(commandBar.query) }
+        lessonDrawn = nil
+        renderLesson()
     }
 
     // MARK: - Teaching
@@ -138,6 +264,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         lessons.onStep = { [weak self] progress, step in
             guard let self else { return }
             guard let step else {
+                self.stopLessonRendering()
                 self.overlay.hide()
                 self.voice.speak("That's it — \(progress.lesson.title) done.")
                 NSLog("ScreenCoach: lesson finished")
@@ -150,39 +277,138 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
                          number, ms / 1000))
             _ = self
         }
+        // A step the runner cannot see finish must say how to move on, or
+        // the learner is left under a dimmed screen with no way forward. A
+        // manual step already says so as part of its spoken instruction (see
+        // `showStep`); speaking again here would cut that sentence off.
+        lessons.onStall = { [weak self] progress, _, reason in
+            guard let self else { return }
+            switch reason {
+            case .manualStep:
+                NSLog("ScreenCoach: step \(progress.stepNumber) is manual — waiting for Next Step")
+            case .timedOut:
+                NSLog("ScreenCoach: step \(progress.stepNumber) not seen to finish — waiting for Next Step")
+                self.voice.speak("I can't tell whether that's done. "
+                                 + "Choose Next Step from the menu to continue.")
+                self.setActivity("Step \(progress.stepNumber): choose Next Step to continue",
+                                 owner: .lesson)
+            }
+        }
     }
 
-    /// Point at the step, dim everything else, number it, and say it.
+    /// A new step: say it, and draw it.
     ///
     /// The scrim is the affordance that turns pointing into teaching: during a
     /// step the rest of the screen recedes and the control you need is the
     /// only lit thing. A one-shot answer never does this — dimming the whole
     /// screen to answer a quick question would be obnoxious.
     private func showStep(_ progress: LessonProgress, _ rawStep: Step) {
-        guard let tree = cache.tree() else { return }
-        let step = rawStep.resolved(appName: tree.appName)
-        let ranked = AXResolver.rank(query: step.target, in: tree.nodes,
-                                     windowBounds: extent(of: tree), limit: 1)
-        guard let best = ranked.first else {
-            // The step's target is not on screen yet — normal at the start of
-            // a step whose predecessor opened a menu. Say the instruction and
-            // let the watcher catch up.
-            commandBar.setStatus(progress.caption)
-            voice.speak(step.instruction)
+        // Say each step once. Drawing is idempotent and re-evaluated on every
+        // tick; speech is not, and a re-announced step would talk over itself.
+        let key = "\(progress.lesson.title)#\(progress.stepNumber)"
+        if key != spokenStepKey {
+            spokenStepKey = key
+            let appName = cache.cachedEntry?.snapshot.appName ?? "this app"
+            var line = rawStep.resolved(appName: appName).instruction
+            if rawStep.completion == .manual {
+                line += " Choose Next Step from the menu when you're done."
+            }
+            voice.speak(line)
+        }
+        lessonDrawn = nil
+        lessonWaitingForTarget = false
+        startLessonRendering()
+        renderLesson()
+    }
+
+    /// The step on screen is a function of state, re-evaluated four times a
+    /// second rather than drawn once at step start: a target that appears
+    /// late (the menu that the previous step opened), a window that moves, a
+    /// display change, or a one-shot answer that borrowed the overlay all
+    /// leave a stale or missing highlight otherwise.
+    private func startLessonRendering() {
+        guard lessonRenderTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 0.25, repeating: 0.25, leeway: .milliseconds(80))
+        t.setEventHandler { [weak self] in self?.renderLesson() }
+        t.resume()
+        lessonRenderTimer = t
+    }
+
+    private func stopLessonRendering() {
+        spokenStepKey = nil
+        lessonRenderTimer?.cancel()
+        lessonRenderTimer = nil
+        lessonDrawn = nil
+        lessonWaitingForTarget = false
+        clearActivity(.lesson)
+    }
+
+    private func renderLesson() {
+        guard lessons.isRunning, let progress = lessons.progress,
+              let rawStep = progress.current else {
+            if lessonRenderTimer != nil { stopLessonRendering() }
             return
         }
-        let confident = best.score >= AXResolver.hitThreshold
-        overlay.teach(step: best.node.bounds,
+        // A one-shot answer has the overlay; the lesson comes back when it ends.
+        guard !oneShotVisible else { return }
+
+        let tree = cache.tree()
+        let best = tree.flatMap { t in
+            AXResolver.rank(query: rawStep.resolved(appName: t.appName).target,
+                            in: t.nodes, windowBounds: extent(of: t), limit: 1).first
+        }
+        guard let best else {
+            // The target is not on screen yet — normal right after a step
+            // that opened a menu. Take the previous step's highlight down
+            // (leaving it lit tells the learner to repeat what they just
+            // did) and show where they are somewhere visible: the command
+            // bar was dismissed when the lesson started.
+            if lessonDrawn != nil || !lessonWaitingForTarget {
+                overlay.hide()
+                lessonDrawn = nil
+                lessonWaitingForTarget = true
+                setActivity(progress.caption, owner: .lesson)
+            }
+            return
+        }
+
+        let frame = LessonFrame(stepNumber: progress.stepNumber,
+                                rect: reattributed(best.node.bounds),
+                                confident: best.score >= AXResolver.hitThreshold)
+        if let drawn = lessonDrawn, drawn.matches(frame) { return }
+        // Fly in for a new step (or a forced redraw, which clears
+        // lessonDrawn); a target that merely moved, such as a window being
+        // dragged, is followed without replaying the flight every frame.
+        overlay.teach(step: frame.rect,
                       caption: progress.caption,
                       stepNumber: progress.stepNumber,
-                      confidence: confident ? .exact : .uncertain)
-        voice.speak(step.instruction)
+                      confidence: frame.confident ? .exact : .uncertain,
+                      animated: lessonDrawn?.stepNumber != progress.stepNumber)
+        lessonDrawn = frame
+        if lessonWaitingForTarget {
+            lessonWaitingForTarget = false
+            clearActivity(.lesson)
+        }
     }
 
     @objc private func startLesson(_ sender: NSMenuItem) {
         guard let lesson = BuiltInLessons.all[safe: sender.tag] else { return }
-        commandBar.dismiss()
+        endTurnForLesson()
+        stopLessonRendering()
         lessons.start(lesson)
+    }
+
+    /// A lesson takes over the overlay: whatever the last query was doing,
+    /// including a vision call still in flight, is finished.
+    private func endTurnForLesson() {
+        beginNewTurn()
+        stopListening()
+        oneShotEnd?.cancel()
+        oneShotEnd = nil
+        oneShotVisible = false
+        provisionalVisible = false
+        commandBar.dismiss()
     }
 
     @objc private func startSavedLesson(_ sender: NSMenuItem) {
@@ -196,7 +422,8 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
            wanted != current {
             voice.speak("This was recorded in a different app. I'll try anyway.")
         }
-        commandBar.dismiss()
+        endTurnForLesson()
+        stopLessonRendering()
         lessons.start(lesson)
     }
 
@@ -238,8 +465,22 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Next Step: the way forward from a manual step, from a step the
+    /// watcher could not see finish, and for a learner who knows better than
+    /// the tree does.
+    @objc private func nextStep() {
+        guard lessons.isRunning else { return }
+        lessons.advance()
+    }
+
+    @objc private func previousStep() {
+        guard lessons.isRunning else { return }
+        lessons.back()
+    }
+
     @objc private func stopLesson() {
         lessons.stop()
+        stopLessonRendering()
         overlay.hide()
     }
 
@@ -247,21 +488,115 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
 
     private func wireVoice() {
         voice.onPartial = { [weak self] text in
+            guard let self, self.turns.isCurrent(self.listeningTurn) else { return }
             // Live transcript goes straight into the same field typing uses,
             // so the two input paths converge before anything downstream has
             // to care which one produced the query.
-            self?.commandBar.setQuery(text)
-            self?.preview(text)
+            if !text.isEmpty { self.heardThisHold = true }
+            self.commandBar.setQuery(text)
+            self.preview(text)
         }
         voice.onFinal = { [weak self] text, sttMs in
             guard let self else { return }
+            // An utterance belongs to the turn that opened the microphone. If
+            // the user has since cancelled or asked something else, acting on
+            // it would point at a target nobody is asking about any more.
+            guard self.turns.isCurrent(self.listeningTurn) else {
+                NSLog("ScreenCoach: dropped a transcript from an earlier turn")
+                return
+            }
             self.lastTrace.record(.stt, ms: sttMs)
-            self.spokeThisTurn = true
-            self.resolveAndPoint(text)
+            self.resolveAndPoint(text, spoken: true)
         }
         voice.onState = { [weak self] state in
-            self?.commandBar.setStatus(state)
+            guard let self, self.turns.isCurrent(self.listeningTurn) else { return }
+            self.commandBar.setStatus(state)
         }
+    }
+
+    /// Whether this process can ask for Speech and Microphone at all. The
+    /// request needs the usage strings in Info.plist; an unbundled `swift
+    /// build` binary has none, and asking from it kills the process.
+    private var canAskForVoicePermission: Bool { Voice.canAskForPermission }
+
+    private var voicePermissionUndetermined: Bool { Voice.permissionsUndetermined }
+
+    private func requestVoicePermissionsIfUndetermined() {
+        guard !voicePermissionAsked, voicePermissionUndetermined else { return }
+        guard canAskForVoicePermission else {
+            NSLog("ScreenCoach: voice needs the bundled app (no usage strings) — typing only")
+            return
+        }
+        voicePermissionAsked = true
+        voice.requestPermissions { [weak self] availability in
+            guard let self else { return }
+            NSLog("ScreenCoach: voice permissions — \(Voice.permissionSummary)")
+            if self.commandBar.isVisible, !self.voice.isListening {
+                self.commandBar.setStatus(self.voiceNote(for: availability) ?? "Voice ready — hold ⌥Space to speak")
+            }
+        }
+    }
+
+    /// Why a hold will not listen, in words the status line can show. Nil
+    /// when voice is ready.
+    private func voiceNote(for availability: Voice.Availability) -> String? {
+        switch availability {
+        case .ready:
+            return nil
+        case .needsPermission(let what):
+            if voicePermissionUndetermined && canAskForVoicePermission {
+                return "Allow \(what) access to speak — type for now"
+            }
+            if !canAskForVoicePermission {
+                return "Voice needs the bundled app — type instead"
+            }
+            return "\(what) permission is off — type instead, or allow it in "
+                 + "System Settings › Privacy & Security"
+        case .unavailable(let why):
+            return "Voice unavailable (\(why)) — type instead"
+        }
+    }
+
+    /// Open the microphone for the current turn. Returns a note for the
+    /// status line when it could not.
+    private func startListening() -> String? {
+        let availability = voice.availability
+        if case .needsPermission = availability {
+            // Ask at the moment of need too, in case the launch-time request
+            // never ran (the grant arrived later, or it was declined as a
+            // dialog rather than decided).
+            requestVoicePermissionsIfUndetermined()
+        }
+        if let note = voiceNote(for: availability) { return note }
+        listeningTurn = turns.current
+        heardThisHold = false
+        voice.begin()
+        guard voice.isListening else { return "The microphone didn't start — type instead" }
+        armHoldExpiry()
+        return nil
+    }
+
+    /// The microphone must not outlive the turn. Every path that ends a turn
+    /// — Escape, Return, focus loss, a lesson starting — comes through here.
+    private func stopListening() {
+        holdExpiry?.cancel()
+        holdExpiry = nil
+        ptt.reset()
+        if voice.isListening { voice.cancel() }
+    }
+
+    private func armHoldExpiry() {
+        holdExpiry?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if case .finishUtterance = self.ptt.expire(atNs: Mono.nowNs()), self.voice.isListening {
+                NSLog("ScreenCoach: hold outlived its limit — closing the microphone")
+                self.voice.end()
+            }
+        }
+        holdExpiry = work
+        let seconds = Double(ptt.maxHoldNs) / 1e9 + 0.05
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
     }
 
     /// Hold to speak, tap to type.
@@ -270,26 +605,59 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
     /// that turns out to be short still delivers whatever was said. Under the
     /// threshold with nothing heard, the bar simply stays open for typing —
     /// which is also the graceful path when the microphone is unavailable.
-    private func releaseHold() {
-        let heldMs = holdStartedNs == 0 ? 0 : Mono.msSince(holdStartedNs)
-        holdStartedNs = 0
-        guard voice.isListening else { return }
-        if heldMs < 300 {
+    private func releaseHold(at upNs: UInt64) {
+        let action = ptt.keyUp(atNs: upNs, heardText: heardThisHold)
+        holdExpiry?.cancel()
+        holdExpiry = nil
+        guard voice.isListening, turns.isCurrent(listeningTurn) else { return }
+        switch action {
+        case .cancelToTyping:
             voice.cancel()
             commandBar.setStatus("type a target, or hold ⌥Space to speak")
-            return
+        case .finishUtterance:
+            voice.end()
+        case .startListening, .restartListening, .ignore:
+            break
         }
-        voice.end()
     }
 
     // MARK: - The turn
 
-    private func summon(at eventNs: UInt64) {
+    /// Open the bar for a new turn.
+    ///
+    /// `listen` is true only for the hotkey, whose key-up closes the
+    /// microphone. The menu item has no key to release, so it is typing only
+    /// — otherwise it would open a microphone nothing ever closes.
+    private func summon(at eventNs: UInt64, listen: Bool) {
+        var voiceNote: String?
+        if listen {
+            switch ptt.keyDown(atNs: eventNs) {
+            case .ignore:
+                return   // auto-repeat of a hold already in progress
+            case .restartListening:
+                // The last key-up was lost. Close that capture before
+                // starting this one, or begin() would refuse.
+                holdExpiry?.cancel()
+                if voice.isListening { voice.cancel() }
+            default:
+                break
+            }
+        } else {
+            stopListening()
+        }
+
+        beginNewTurn()
         lastTrace = LatencyTrace()
         lastTrace.begin(.hotkeyToFrame, at: eventNs)
 
-        // The tree is already warm — this is the payoff for the speculative
-        // extraction Phase 0 proved mandatory. Reading it here costs about a
+        // Start capturing before anything that can block the main thread.
+        // A cold tree read after switching apps costs 45–220 ms, and every
+        // one of those milliseconds would otherwise be clipped from the
+        // front of the utterance — usually the word that names the target.
+        if listen { voiceNote = startListening() }
+
+        // The tree is usually warm — the payoff for the speculative
+        // extraction Phase 0 proved mandatory — and reading it costs about a
         // millisecond instead of the 45–220 ms a cold walk would.
         lastTrace.begin(.axExtract)
         let tree = cache.tree()
@@ -297,22 +665,65 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         lastTrace.end(.hotkeyToFrame)
 
         guard let tree else {
-            commandBar.present(status: "No accessible window in front.")
+            stopListening()
+            commandBar.present(status: explainMissingTree())
             return
         }
-        let labelled = tree.labelledCount
-        let status = String(
+        var status = String(
             format: "%@ · %d controls · tree %.0f ms old",
-            tree.appName, labelled, cache.cachedEntry?.ageMs ?? 0
+            tree.appName, tree.labelledCount, cache.cachedEntry?.ageMs ?? 0
         )
+        if voice.isListening {
+            status = "Listening — release to go · " + status
+        } else if let voiceNote {
+            status = voiceNote + " · " + status
+        }
         commandBar.present(status: status)
+    }
 
-        // Start capturing immediately on key-down. Waiting to decide whether
-        // this is a hold or a tap would clip the first word, which is usually
-        // the one that names the target.
-        spokeThisTurn = false
-        holdStartedNs = Mono.nowNs()
-        if case .ready = voice.availability { voice.begin() }
+    /// Why there is no tree, rather than a generic "no window" that reads
+    /// like a bug: missing permission and the privacy gate are both
+    /// deliberate states the user can do something about.
+    private func explainMissingTree() -> String {
+        if !AXExtractor.isTrusted {
+            if !accessibilityPromptOffered {
+                accessibilityPromptOffered = true
+                AXExtractor.requestPermission()
+            }
+            return "Accessibility access is off — allow Screen Coach in "
+                 + "System Settings › Privacy & Security › Accessibility."
+        }
+        if let why = cache.lastExclusionReason {
+            let me = ProcessInfo.processInfo.processIdentifier
+            let front = NSWorkspace.shared.frontmostApplication
+            let name = front.flatMap { $0.processIdentifier == me ? nil : $0.localizedName }
+                ?? "this app"
+            return "Not looking at \(name) — it is excluded (\(why))."
+        }
+        return "No accessible window in front."
+    }
+
+    /// Every turn starts here. Whatever the previous turn left in flight is
+    /// abandoned: its queued vision job is cancelled (a running one finds its
+    /// turn gone and discards its answer), and a provisional "checking…"
+    /// pointer that will now never be refined is taken down.
+    @discardableResult
+    private func beginNewTurn() -> UInt64 {
+        let turn = turns.advance()
+        pendingVision?.cancel()
+        pendingVision = nil
+        clearActivity(.vision)
+        if provisionalVisible { endOneShot() }
+        return turn
+    }
+
+    /// Escape, or a click away from the bar.
+    private func cancelTurn() {
+        beginNewTurn()
+        stopListening()
+        commandBar.dismiss()
+        // Only a one-shot answer is ours to take down; a lesson step stays.
+        if oneShotVisible { endOneShot() }
     }
 
     /// Live shortlist as the user types. Cheap enough to run on every
@@ -329,14 +740,25 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         })
     }
 
-    private func resolveAndPoint(_ query: String) {
-        guard let tree = cache.tree() else { return }
+    private func resolveAndPoint(_ query: String, spoken: Bool) {
+        // Typed Return while a hold is still open, or a final transcript:
+        // either way the microphone's job for this turn is done.
+        stopListening()
+        let turn = beginNewTurn()
+
+        guard let tree = cache.tree() else {
+            notify(explainMissingTree())
+            return
+        }
         let bounds = extent(of: tree)
 
         lastTrace.begin(.axResolve)
         let ranked = AXResolver.rank(query: query, in: tree.nodes,
                                      windowBounds: bounds, limit: 3)
         lastTrace.end(.axResolve)
+        // Down before anything else, and it stays down while vision runs:
+        // the bar sits in the middle of the display that is about to be
+        // captured, and the model should see the app, not our question.
         commandBar.dismiss()
 
         let axCandidate = ranked.first.map {
@@ -344,6 +766,8 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
                                label: $0.node.title ?? $0.node.roleDescription
                                       ?? $0.node.humanRole)
         }
+        let axOnly = Fusion.decide(ax: axCandidate, vision: nil,
+                                   axHitThreshold: AXResolver.hitThreshold)
 
         // Does this even need vision? Measured at ~1.7 ms per image token, so
         // the answer is no whenever the tree already answered well — checking
@@ -355,62 +779,128 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         )
 
         guard wantsVision else {
-            present(Fusion.decide(ax: axCandidate, vision: nil,
-                                  axHitThreshold: AXResolver.hitThreshold),
-                    query: query, tree: tree)
+            present(axOnly, query: query, tree: tree, spoken: spoken)
             return
         }
 
-        // The privacy gate comes before the capture, not after. A frame that
-        // exists and is then discarded has still existed.
+        // A cheap early refusal on what the tree says. It is not the gate —
+        // the tree can be seconds old by the time a capture would happen —
+        // so the authoritative check runs again on the vision queue,
+        // immediately before the capture. See `captureRefusal`.
         let verdict = exclusions.check(bundleID: tree.bundleID, windowTitle: tree.windowTitle)
-        guard !verdict.excluded else {
-            present(Fusion.decide(ax: axCandidate, vision: nil,
-                                  axHitThreshold: AXResolver.hitThreshold),
-                    query: query, tree: tree,
-                    note: "not captured — \(verdict.reason ?? "excluded")")
+        // The tree's title can be seconds old; a tab that has just switched
+        // to an excluded title is caught here from the window server, so the
+        // note says "not captured" instead of "checking…".
+        let freshRefusal = verdict.excluded ? nil
+            : ScreenGrab.frontWindowExclusion(pid: tree.pid, exclusions: exclusions.current)
+        guard !verdict.excluded, freshRefusal == nil else {
+            let why = verdict.reason ?? freshRefusal ?? "excluded"
+            if axOnly != nil {
+                present(axOnly, query: query, tree: tree, spoken: spoken,
+                        note: "not captured — \(why)")
+            } else {
+                notify("Nothing in \(tree.appName)'s accessibility tree matches “\(query)”, "
+                       + "and the screen was not captured — \(why).")
+            }
             return
         }
 
         // Show the tree's answer immediately rather than making the user wait
         // on the model. The pointer is already flying while vision runs, and
         // the ring is upgraded or downgraded when the second opinion lands.
-        present(Fusion.decide(ax: axCandidate, vision: nil,
-                              axHitThreshold: AXResolver.hitThreshold),
-                query: query, tree: tree,
-                note: axCandidate == nil ? "looking…" : "checking…")
+        // With no tree answer at all there is nothing to fly to yet: say
+        // "looking" in the menu bar and keep quiet until vision decides,
+        // rather than announcing "nothing matches" and then contradicting it.
+        if let axOnly {
+            present(axOnly, query: query, tree: tree, spoken: spoken,
+                    note: "checking…", holdFor: Self.provisionalSeconds)
+            provisionalVisible = true
+        } else {
+            setActivity("Looking for “\(query)”…", owner: .vision)
+            CommandBar.announce("Looking for \(query)")
+        }
 
-        visionQueue.async { [weak self] in
+        let job = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            let vision = self.runVision(query: query, tree: tree, ax: axCandidate)
+            // Skip work whose turn is already over — it would only occupy
+            // the one model while the user waits on a newer query.
+            guard self.turns.isCurrent(turn) else { return }
+            let outcome = self.runVision(query: query, tree: tree, ax: axCandidate, turn: turn)
             DispatchQueue.main.async {
-                guard vision != nil || axCandidate != nil else {
-                    self.notify("Nothing in \(tree.appName) matches “\(query)”.")
-                    return
-                }
-                self.present(Fusion.decide(ax: axCandidate, vision: vision,
-                                           axHitThreshold: AXResolver.hitThreshold),
-                             query: query, tree: tree)
+                self.finishVision(outcome, turn: turn, query: query, tree: tree,
+                                  ax: axCandidate, provisional: axOnly, spoken: spoken)
             }
         }
+        pendingVision = job
+        visionQueue.async(execute: job)
+    }
+
+    private struct VisionOutcome {
+        var candidate: Fusion.VisionCandidate?
+        /// Why there is no candidate, when that is worth telling the user.
+        var whyNot: String?
+        var ms: Double?
+    }
+
+    /// Vision landed, on main. Only the turn that asked may use it.
+    private func finishVision(_ outcome: VisionOutcome, turn: UInt64, query: String,
+                              tree: AXTreeSnapshot, ax: Fusion.AXCandidate?,
+                              provisional: Fusion.Decision?, spoken: Bool) {
+        guard turns.isCurrent(turn) else {
+            NSLog("ScreenCoach: dropped a vision answer for “\(query)” — a newer turn owns the screen")
+            return
+        }
+        pendingVision = nil
+        clearActivity(.vision)
+        if let ms = outcome.ms { lastTrace.record(.visionGround, ms: ms) }
+
+        guard let decision = Fusion.decide(ax: ax, vision: outcome.candidate,
+                                           axHitThreshold: AXResolver.hitThreshold) else {
+            // Both came back empty — only now is "nothing matches" true.
+            var text = "Nothing in \(tree.appName) matches “\(query)”."
+            if let why = outcome.whyNot { text += " (\(why))" }
+            notify(text)
+            return
+        }
+        present(decision, query: query, tree: tree, spoken: spoken, replacing: provisional)
     }
 
     /// Capture, aim, ground. Runs off the main thread; everything it needs
     /// about the target was captured in `tree` before it started.
     private func runVision(query: String, tree: AXTreeSnapshot,
-                           ax: Fusion.AXCandidate?) -> Fusion.VisionCandidate? {
+                           ax: Fusion.AXCandidate?, turn: UInt64? = nil) -> VisionOutcome {
+        visionUsed = true
         guard grounding.startIfNeeded() else {
             NSLog("ScreenCoach: \(grounding.statusLine)")
-            return nil
+            return VisionOutcome(whyNot: grounding.statusLine)
         }
-        guard let shot = ScreenGrab.display(containing: extent(of: tree)) else { return nil }
+        // First use can spend minutes loading the model. The turn may have
+        // ended meanwhile, and a capture nobody will look at must not happen.
+        if let turn, !turns.isCurrent(turn) { return VisionOutcome() }
+
+        // The privacy gate, at the moment of capture. What the tree said
+        // seconds ago is not what is on the display now.
+        let target = extent(of: tree)
+        if let refusal = captureRefusal(for: tree, displayIndex: target.screenIndex) {
+            NSLog("ScreenCoach: capture refused — \(refusal)")
+            return VisionOutcome(whyNot: "screen not captured — \(refusal)")
+        }
+        // ScreenGrab applies the rules to the frame itself: excluded apps,
+        // windows with excluded titles and the coach's own overlay are cut
+        // out before any pixel exists, and the target's front window title
+        // is re-read from the window server once more right before capture.
+        // Nil means capture failed or that last check refused.
+        guard let shot = ScreenGrab.display(containing: target,
+                                            exclusions: exclusions.current,
+                                            targetPID: tree.pid) else {
+            return VisionOutcome(whyNot: "screen not captured")
+        }
 
         // Aim the crop with the tree even though the tree could not answer.
         // Phase 0 measured this at full-frame accuracy for a third of the
         // latency; the sidecar test above showed 1337 ms versus 9676 ms on the
         // same target.
-        let hint = AXResolver.cropHint(query: query, in: tree.nodes,
-                                       windowBounds: extent(of: tree))
+        let hint = AXResolver.cropHint(query: query, in: tree.nodes, windowBounds: target)
         let cropPixels = hint.isWholeWindow ? nil : CGRect(
             x: (hint.rect.cg.minX - shot.origin.x) * shot.scale,
             y: (hint.rect.cg.minY - shot.origin.y) * shot.scale,
@@ -424,18 +914,60 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             screenIndex: shot.screenIndex, displayScale: shot.scale,
             displayOrigin: shot.origin
         )
-        DispatchQueue.main.async { [weak self] in
-            self?.lastTrace.record(.visionGround, ms: Mono.msSince(started))
+        let ms = Mono.msSince(started)
+        guard let result else {
+            return VisionOutcome(whyNot: "the vision model found nothing", ms: ms)
         }
-        guard let result else { return nil }
         NSLog(String(format: "ScreenCoach: vision %.0f ms ttft, %d tokens%@",
                      result.ttftMs, result.imageTokens,
                      cropPixels == nil ? " (full frame)" : " (AX-aimed crop)"))
-        return Fusion.VisionCandidate(point: result.point)
+        return VisionOutcome(candidate: Fusion.VisionCandidate(point: result.point), ms: ms)
     }
 
+    /// The capture-time privacy gate. Returns why the display must not be
+    /// captured at all, or nil when it may be.
+    ///
+    /// Other excluded apps and windows on the display do not refuse the
+    /// capture: `ScreenGrab` removes them from the frame. What is refused
+    /// here is a capture whose premise has gone — a different app came to
+    /// the front, the target's own front window is now excluded, or the
+    /// display the tree was on no longer exists.
+    private func captureRefusal(for tree: AXTreeSnapshot, displayIndex: Int) -> String? {
+        var refusal: String?
+        let rules = exclusions.current
+        let check = {
+            let me = ProcessInfo.processInfo.processIdentifier
+            if let front = NSWorkspace.shared.frontmostApplication,
+               front.processIdentifier != me, front.processIdentifier != tree.pid {
+                refusal = "\(front.localizedName ?? "another app") came to the front"
+                return
+            }
+            if let why = ScreenGrab.frontWindowExclusion(pid: tree.pid, exclusions: rules) {
+                refusal = "\(tree.appName) is showing an excluded window (\(why))"
+                return
+            }
+            if DisplaySpace.current().display(at: displayIndex) == nil {
+                refusal = "the display changed"
+            }
+        }
+        // On main, where the workspace is current; the self test calls this
+        // from main already.
+        if Thread.isMainThread { check() } else { DispatchQueue.main.sync(execute: check) }
+        return refusal
+    }
+
+    /// Put an answer on screen.
+    ///
+    /// - `holdFor`: how long it stays up. A provisional answer waiting on
+    ///   vision stays until the refinement lands (or a generous cap), rather
+    ///   than vanishing at 4.5 s while the model is still working.
+    /// - `replacing`: the provisional answer this refines. When the target
+    ///   and ring are unchanged the pointer is left where it is instead of
+    ///   flying in from the mouse a second time.
     private func present(_ decision: Fusion.Decision?, query: String,
-                         tree: AXTreeSnapshot, note: String? = nil) {
+                         tree: AXTreeSnapshot, spoken: Bool, note: String? = nil,
+                         holdFor: TimeInterval = ScreenCoachApp.answerSeconds,
+                         replacing provisional: Fusion.Decision? = nil) {
         guard let decision else {
             notify("Nothing in \(tree.appName) matches “\(query)”.")
             return
@@ -444,10 +976,22 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         if decision.confidence == .uncertain { caption += "?" }
         if let note { caption += "  ·  \(note)" }
 
-        lastTrace.begin(.pointerStart)
-        overlay.point(at: decision.target, caption: caption,
-                      confidence: decision.confidence == .exact ? .exact : .uncertain)
-        lastTrace.end(.pointerStart)
+        let sameTarget = provisional.map { $0.target == decision.target } ?? false
+        provisionalVisible = false
+        let confidence: PointerLayer.Confidence = decision.confidence == .exact ? .exact : .uncertain
+        if sameTarget && oneShotVisible
+            && overlay.update(caption: caption, confidence: confidence) {
+            // Same control: the ring settles in place (new caption, new
+            // confidence) instead of flying in from the mouse a second time.
+            scheduleOneShotEnd(after: holdFor)
+        } else {
+            lastTrace.begin(.pointerStart)
+            overlay.point(at: reattributed(decision.target), caption: caption,
+                          confidence: confidence, dismissAfter: holdFor + 0.5)
+            lastTrace.end(.pointerStart)
+            oneShotVisible = true
+            scheduleOneShotEnd(after: holdFor)
+        }
 
         if let why = decision.explanation { NSLog("ScreenCoach: \(why)") }
         NSLog("ScreenCoach: “\(query)” → \(decision.label) [\(decision.source.rawValue)]")
@@ -455,7 +999,66 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         // Speak only when spoken to. A voice that answers typed input is
         // startling in a shared office, and note never speaks — a spoken
         // "checking…" would be interrupted by the real answer a beat later.
-        if spokeThisTurn && note == nil { voice.speak(spokenAnswer(for: decision)) }
+        // VoiceOver users get the caption either way: without it a typed
+        // query's answer is purely visual.
+        if spoken && note == nil {
+            voice.speak(spokenAnswer(for: decision))
+        } else if note == nil {
+            CommandBar.announce(spokenAnswer(for: decision))
+        }
+    }
+
+    /// The one-shot answer's lifetime is owned here, not by the overlay's
+    /// own timer, so that when it ends during a lesson the lesson's step is
+    /// put back instead of every panel being ordered out.
+    private func scheduleOneShotEnd(after seconds: TimeInterval) {
+        oneShotEnd?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.endOneShot() }
+        oneShotEnd = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
+    private func endOneShot() {
+        oneShotEnd?.cancel()
+        oneShotEnd = nil
+        oneShotVisible = false
+        provisionalVisible = false
+        if lessons.isRunning {
+            lessonDrawn = nil
+            renderLesson()
+        } else {
+            overlay.hide()
+        }
+    }
+
+    /// Belt and braces for a rect whose screen index outlived its display
+    /// arrangement: if the index no longer names a display the rect is on,
+    /// attribute it again from its CG geometry.
+    private func reattributed(_ r: ScreenRect) -> ScreenRect {
+        let space = DisplaySpace.current()
+        if let d = space.display(at: r.screenIndex), d.cgFrame.intersects(r.cg) { return r }
+        guard let index = space.index(bestOverlapping: r.cg) else { return r }
+        return ScreenRect(cg: r.cg, screenIndex: index)
+    }
+
+    // MARK: - Menu bar activity
+
+    private func setActivity(_ text: String, owner: ActivityOwner) {
+        guard let button = statusItem?.button else { return }
+        let limit = 36
+        let short = text.count > limit ? String(text.prefix(limit - 1)) + "…" : text
+        button.title = " " + short
+        button.imagePosition = .imageLeading
+        button.setAccessibilityValue(text)
+        activityOwner = owner
+    }
+
+    private func clearActivity(_ owner: ActivityOwner) {
+        guard activityOwner == owner, let button = statusItem?.button else { return }
+        button.title = ""
+        button.imagePosition = .imageOnly
+        button.setAccessibilityValue(nil)
+        activityOwner = nil
     }
 
     /// The reference extent is the union of the tree's node bounds, never a
@@ -729,6 +1332,13 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             for app in NSWorkspace.shared.runningApplications
             where app.activationPolicy == .regular && !app.isTerminated {
                 let name = app.localizedName ?? "?"
+                // The diagnostic obeys the same gate as the product: an
+                // excluded app's tree is not read, not even to count it.
+                let verdict = exclusions.check(bundleID: app.bundleIdentifier, windowTitle: nil)
+                if verdict.excluded {
+                    print("  \(name): excluded — not read (\(verdict.reason ?? "excluded"))")
+                    continue
+                }
                 do {
                     let t = try AXExtractor.windowTree(
                         pid: app.processIdentifier, appName: name,
@@ -815,12 +1425,13 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         var visionCandidate: Fusion.VisionCandidate?
         if wantsVision && !verdict.excluded && CommandLine.arguments.contains("--vision") {
             print("Vision     loading model…")
-            visionCandidate = runVision(query: query, tree: tree, ax: axCandidate)
+            let outcome = runVision(query: query, tree: tree, ax: axCandidate)
+            visionCandidate = outcome.candidate
             if let v = visionCandidate {
                 print(String(format: "           click cg(%.0f,%.0f) screen %d",
                              v.point.cg.x, v.point.cg.y, v.point.screenIndex))
             } else {
-                print("           unavailable — \(grounding.statusLine)")
+                print("           unavailable — \(outcome.whyNot ?? grounding.statusLine)")
             }
         }
 
@@ -853,6 +1464,16 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         let status = NSMenuItem(title: "…", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+        // Vision and privacy state, so a sidecar failure (with its stderr)
+        // and an exclusions file that could not be read are visible.
+        let visionStatus = NSMenuItem(title: "…", action: nil, keyEquivalent: "")
+        visionStatus.isEnabled = false
+        menu.addItem(visionStatus)
+        visionStatusItem = visionStatus
+        let privacyStatus = NSMenuItem(title: "…", action: nil, keyEquivalent: "")
+        privacyStatus.isEnabled = false
+        menu.addItem(privacyStatus)
+        privacyStatusItem = privacyStatus
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Point at Something…  ⌥Space",
                                 action: #selector(summonFromMenu), keyEquivalent: ""))
@@ -868,6 +1489,14 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
             item.target = self
             sub.addItem(item)
         }
+        sub.addItem(.separator())
+        let next = NSMenuItem(title: "Next Step", action: #selector(nextStep), keyEquivalent: "")
+        next.target = self
+        sub.addItem(next)
+        let previous = NSMenuItem(title: "Previous Step", action: #selector(previousStep),
+                                  keyEquivalent: "")
+        previous.target = self
+        sub.addItem(previous)
         sub.addItem(.separator())
         let record = NSMenuItem(title: "Record a Workflow",
                                 action: #selector(toggleRecording), keyEquivalent: "")
@@ -895,8 +1524,15 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
-    @objc private func summonFromMenu() { summon(at: Mono.nowNs()) }
-    @objc private func refreshNow() { _ = cache.tree() }
+    // Typing only: a menu click has no key-up to close a microphone.
+    @objc private func summonFromMenu() { summon(at: Mono.nowNs(), listen: false) }
+
+    /// Re-read now, even when the cached tree is under five seconds old —
+    /// that is the case the user reaches for this item in.
+    @objc private func refreshNow() {
+        cache.refreshNow()
+        if commandBar.isVisible { preview(commandBar.query) }
+    }
 
     /// What the coach says out loud. Short, and it carries the same
     /// uncertainty the ring does — a confident sentence over a dashed ring
@@ -910,7 +1546,7 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
         case .uncertain:
             switch decision.source {
             case .vision:
-                return "I can't see this one in the accessibility tree, "
+                return "I couldn't find a clear match in the accessibility tree, "
                      + "so this is my best guess."
             case .conflicted:
                 return "I think it's \(decision.label), but I'm not certain."
@@ -950,9 +1586,22 @@ final class ScreenCoachApp: NSObject, NSApplicationDelegate {
     }
 }
 
+extension ScreenCoachApp: NSMenuItemValidation {
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(nextStep), #selector(previousStep):
+            return lessons.isRunning
+        default:
+            return true
+        }
+    }
+}
+
 extension ScreenCoachApp: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menu.items.first?.title = cache.statusLine
+        visionStatusItem?.title = "Vision: " + (visionUsed ? grounding.statusLine : "not started")
+        privacyStatusItem?.title = "Privacy: " + exclusions.statusLine
 
         // Repopulate saved workflows each open — recordings made or deleted
         // since the last open should just be there, no restart.
