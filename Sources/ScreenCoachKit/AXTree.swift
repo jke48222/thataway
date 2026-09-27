@@ -35,8 +35,10 @@ public enum AXExtractor {
         /// Wall-clock ceiling for the whole walk. Hitting this returns a
         /// truncated-but-honest tree rather than blowing the budget.
         public var deadlineMs: Double
-        /// Per-element AX messaging timeout. The default is effectively
-        /// unbounded, which hangs us against a beachballing app.
+        /// AX messaging timeout, in seconds, for every element this process
+        /// messages (set process-wide on the system-wide element). The
+        /// default is about six seconds per call, which hangs us against a
+        /// beachballing app.
         public var messagingTimeout: Float
         /// Longest value string kept. An `AXTextArea` holding a whole source
         /// file would otherwise dominate both time and memory for no gain.
@@ -153,6 +155,13 @@ public enum AXExtractor {
         forceElectron: Bool = true
     ) throws -> AXTreeSnapshot {
         let started = Mono.nowNs()
+        // The timeout set on an element applies to that element only; the
+        // window, the menu bar and every child read from them would use the
+        // global default of about six seconds, so one stalled child read
+        // could freeze the caller far past `deadlineMs`. Setting it on the
+        // system-wide element makes it the default for every element this
+        // process messages. It is a local setting, not an IPC call.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), limits.messagingTimeout)
         let appElement = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appElement, limits.messagingTimeout)
 
@@ -290,6 +299,20 @@ public enum AXExtractor {
     }
 
     // MARK: - Window lookup
+
+    /// The title of the window a walk would read, and nothing else: at most
+    /// three attribute reads, no tree. Callers use it to evaluate title
+    /// exclusion rules before deciding whether to walk, because the window
+    /// server withholds other apps' titles from a process without Screen
+    /// Recording permission. Only call it for an app that has already
+    /// passed the bundle-ID check.
+    public static func focusedWindowTitle(pid: pid_t, messagingTimeout: Float = 0.1) -> String? {
+        let appElement = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElement, messagingTimeout)
+        guard let win = focusedWindow(of: appElement) else { return nil }
+        AXUIElementSetMessagingTimeout(win, messagingTimeout)
+        return copyString(win, kAXTitleAttribute as String, maxChars: 200)
+    }
 
     /// Focused window, then main window, then the first of `AXWindows`.
     /// Apps disagree about which of these they populate; a coach that only

@@ -41,5 +41,16 @@ let package = Package(
             dependencies: ["ScreenCoachCore"],
             path: "Tests/ScreenCoachCoreTests"
         ),
+
+        // Kit's pure policies and its process/file plumbing: the hotkey state
+        // machine, capture exclusion plan, cache freshness, exclusion file
+        // reloads, lesson file limits and the sidecar protocol (against a
+        // stand-in Python script). Nothing here needs a display or any TCC
+        // permission.
+        .testTarget(
+            name: "ScreenCoachKitTests",
+            dependencies: ["ScreenCoachKit", "ScreenCoachCore"],
+            path: "Tests/ScreenCoachKitTests"
+        ),
     ]
 )
