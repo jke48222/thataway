@@ -143,19 +143,28 @@ public struct ExclusionList: Equatable, Sendable {
     public static func parseReport(_ text: String) -> (list: ExclusionList, issues: [ParseIssue]) {
         var rules: [Rule] = []
         var issues: [ParseIssue] = []
-        for (i, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false)
-            .enumerated() {
+        // Split on every line-break form, not just "\n". In Swift "\r\n" is
+        // a single Character, so splitting on "\n" never splits a CRLF file
+        // at all: the whole file became one line, either one garbage rule
+        // (non-empty, so no fallback to the defaults) or one long comment
+        // that swallowed every rule. Both fail open. `isNewline` covers
+        // "\n", "\r\n", a lone "\r" and the Unicode separators, and counts
+        // "\r\n" once, so line numbers still match the editor's.
+        var body = Substring(text)
+        if body.first == "\u{FEFF}" { body = body.dropFirst() }
+        for (i, rawLine) in body.split(omittingEmptySubsequences: false,
+                                       whereSeparator: \.isNewline).enumerated() {
             let raw = String(rawLine)
-            let line = stripComment(raw).trimmingCharacters(in: .whitespaces)
+            let line = stripComment(raw).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !line.isEmpty else { continue }
             func note(_ message: String) {
                 issues.append(ParseIssue(line: i + 1,
-                                         text: raw.trimmingCharacters(in: .whitespaces),
+                                         text: raw.trimmingCharacters(in: .whitespacesAndNewlines),
                                          message: message))
             }
             let parts = line.split(separator: ":", maxSplits: 1,
                                    omittingEmptySubsequences: false).map {
-                $0.trimmingCharacters(in: .whitespaces)
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
             }
             guard parts.count == 2 else {
                 note("not a rule: expected “bundle: …” or “title: …”"); continue
@@ -167,7 +176,7 @@ public struct ExclusionList: Equatable, Sendable {
                 // first token is a note the user forgot to mark with `#`.
                 // Keeping the ID and dropping the note is the reading that
                 // excludes what they meant to exclude.
-                let tokens = parts[1].split(whereSeparator: { $0 == " " || $0 == "\t" })
+                let tokens = parts[1].split(whereSeparator: \.isWhitespace)
                 let id = String(tokens[0])
                 if tokens.count > 1 {
                     note("bundle IDs contain no spaces: using “\(id)” and ignoring the rest")

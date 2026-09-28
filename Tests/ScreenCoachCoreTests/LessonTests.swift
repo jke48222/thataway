@@ -249,6 +249,24 @@ final class StepTemplateTests: XCTestCase {
         XCTAssertEqual(r.completion, .elementAppears("Calendar Settings"))
     }
 
+    /// The caption beside the ring and in the menu bar used to be built from
+    /// the unresolved step, so it read "Open the {app} menu" while speech
+    /// said the app's name.
+    func testCaptionResolvesTheTemplate() {
+        var p = LessonProgress(lesson: Lesson(title: "Open {app} settings", steps: [
+            Step(instruction: "Open the {app} menu, right next to the Apple menu",
+                 target: "the {app} menu"),
+            Step(instruction: "Choose Settings", target: "the Settings menu item"),
+        ]))
+        let first = p.caption(appName: "Safari")
+        XCTAssertEqual(first, "1/2  Open the Safari menu, right next to the Apple menu")
+        XCTAssertFalse(first.contains("{"))
+        p.advance()
+        XCTAssertEqual(p.caption(appName: "Safari"), "2/2  Choose Settings")
+        p.advance()
+        XCTAssertEqual(p.caption(appName: "Safari"), "Open Safari settings: done")
+    }
+
     func testTemplateFreeStepsPassThroughUntouched() {
         let step = Step(instruction: "Click Share", target: "the Share button",
                         completion: .targetChanges)

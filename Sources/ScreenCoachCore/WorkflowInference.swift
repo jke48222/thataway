@@ -84,31 +84,77 @@ public enum WorkflowInference {
     /// as is any label that is long or covers most of the tree's extent.
     /// Feeding "the Back button in the Delivery Driver Shorts" to the
     /// resolver once cost 5 of 12 exact hits.
+    ///
+    /// Every candidate is checked against the resolver before it is kept. A
+    /// place name with as many words as the label ("the Bold button in the
+    /// Font Options") makes the container's own title the better match, so
+    /// the query re-found the group instead of the checkbox: inference then
+    /// compared the group before and after (a toggle recorded as `.manual`)
+    /// and replay put a confident ring round the whole group. A query is
+    /// only worth recording if it ranks the clicked node first.
     public static func semanticQuery(for node: AXNode, in nodes: [AXNode]) -> String? {
         guard let label = bestLabel(node) else { return nil }
         let noun = nouns[node.role] ?? node.humanRole
-        var query = "the \(label) \(noun)"
+        let bare = "the \(label) \(noun)"
 
         let byID = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
         let extent = nodes.reduce(CGRect.null) { $0.union($1.bounds.cg) }
         let extentArea = extent.isNull ? 0 : extent.width * extent.height
 
+        // Nearest qualifying place first, then outer ones, then no clause.
+        var candidates: [String] = []
+        var window: ScreenRect? = nil
         var cursor = node.parentID
         var hops = 0
-        while let id = cursor, hops < 6, let parent = byID[id] {
-            if parent.isContainer, parent.role != "AXWindow",
+        while let id = cursor, let parent = byID[id] {
+            if parent.role == "AXWindow", window == nil { window = parent.bounds }
+            if hops < 6, parent.isContainer, parent.role != "AXWindow",
                let place = bestLabel(parent), place.count >= 3, place.count <= 24,
                !label.lowercased().contains(place.lowercased()) {
                 let a = parent.bounds.cg.width * parent.bounds.cg.height
                 if extentArea <= 0 || a / extentArea < 0.6 {
-                    query += " in the \(place)"
-                    break
+                    candidates.append("\(bare) in the \(place)")
                 }
             }
             cursor = parent.parentID
             hops += 1
+            if hops > nodes.count { break }  // a malformed parent cycle
         }
-        return query
+        candidates.append(bare)
+
+        // Prefer a query that re-finds the node as a hit, then one that at
+        // least ranks it first. If nothing does, the bare phrase is the most
+        // honest description left.
+        let firsts = candidates.map { ($0, topMatch($0, is: node, in: nodes, window: window)) }
+        if let hit = firsts.first(where: { $0.1 == .hit }) { return hit.0 }
+        if let first = firsts.first(where: { $0.1 == .firstBelowThreshold }) { return first.0 }
+        return bare
+    }
+
+    private enum TopMatch { case hit, firstBelowThreshold, notFirst }
+
+    /// Does `query` rank `node` first (nothing scores higher), the way
+    /// inference and replay rank it?
+    /// Checked with and without the window's size penalty, because
+    /// `inferCompletion` and `LessonEngine` rank without one and the live
+    /// pointer ranks with one; the query has to work for both.
+    private static func topMatch(_ query: String, is node: AXNode, in nodes: [AXNode],
+                                 window: ScreenRect?) -> TopMatch {
+        var bounds: [ScreenRect?] = [nil]
+        if let window { bounds.append(window) }
+        var allHits = true
+        for b in bounds {
+            // Tying with a same-named twin is the resolver's ambiguity, not
+            // the clause's doing, and the bare phrase ties the same way, so
+            // a tie still counts. What disqualifies a query is another node
+            // scoring strictly higher than the one that was clicked.
+            let ranked = AXResolver.rank(query: query, in: nodes, windowBounds: b,
+                                         limit: nodes.count)
+            guard let mine = ranked.first(where: { $0.node.id == node.id }),
+                  let top = ranked.first, top.score <= mine.score else { return .notFirst }
+            if mine.score < AXResolver.hitThreshold { allHits = false }
+        }
+        return allHits ? .hit : .firstBelowThreshold
     }
 
     // MARK: - Completion inference

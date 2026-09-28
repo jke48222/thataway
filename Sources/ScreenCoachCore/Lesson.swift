@@ -227,9 +227,24 @@ public struct LessonProgress: Equatable {
         index = Swift.max(0, index - 1)
     }
 
+    /// The caption as written, with any `{app}` template left in place.
+    /// Only right for lessons that carry no template (every recording); for
+    /// anything shown to the learner use `caption(appName:)`.
     public var caption: String {
         guard let current else { return "\(lesson.title): done" }
         return "\(stepNumber)/\(totalSteps)  \(current.instruction)"
+    }
+
+    /// The caption for the ring and the menu bar, with `{app}` resolved the
+    /// same way the spoken line and the target query are. Built from the
+    /// unresolved step, the Settings lesson showed "Open the {app} menu" on
+    /// screen while speech said "Safari".
+    public func caption(appName: String) -> String {
+        guard let current else {
+            return "\(lesson.title.replacingOccurrences(of: "{app}", with: appName)): done"
+        }
+        let step = current.resolved(appName: appName)
+        return "\(stepNumber)/\(totalSteps)  \(step.instruction)"
     }
 }
 

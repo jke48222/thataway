@@ -334,6 +334,43 @@ final class ExclusionListTests: XCTestCase {
         XCTAssertTrue(reparsed.issues.isEmpty)
     }
 
+    /// A file saved with Windows line endings used to come through as one
+    /// line: "\r\n" is a single Character, so splitting on "\n" never split
+    /// it. Starting with a rule, the whole file became one garbage rule that
+    /// matched nothing and blocked the fallback to the defaults.
+    func testCRLFFileParsesEveryRule() {
+        let report = ExclusionList.parseReport("bundle: com.chase\r\ntitle: my bank\r\n")
+        XCTAssertEqual(report.list.rules.map(\.pattern), ["com.chase", "my bank"])
+        XCTAssertTrue(report.issues.isEmpty, "\(report.issues)")
+        XCTAssertTrue(report.list.check(bundleID: "com.chase.app", windowTitle: nil).excluded)
+        XCTAssertTrue(report.list.check(bundleID: "com.x",
+                                        windowTitle: "My Bank - login").excluded)
+    }
+
+    /// Starting with a comment, as the seeded file does, the whole CRLF file
+    /// used to be read as one comment and every rule was dropped.
+    func testCRLFSeededFileKeepsTheUsersRules() {
+        var list = ExclusionList.defaults
+        list.add(.init(kind: .bundleID, pattern: "com.mine.bank"))
+        let crlf = list.serialized().replacingOccurrences(of: "\n", with: "\r\n")
+        let report = ExclusionList.parseReport(crlf)
+        XCTAssertEqual(report.list.rules.map(\.pattern), list.rules.map(\.pattern))
+        XCTAssertTrue(report.issues.isEmpty, "\(report.issues)")
+        XCTAssertTrue(report.list.check(bundleID: "com.mine.bank", windowTitle: nil).excluded)
+        XCTAssertTrue(report.list.check(bundleID: "com.apple.MobileSMS",
+                                        windowTitle: nil).excluded)
+    }
+
+    /// Old Mac line endings, a byte-order mark and a mix of forms all split
+    /// the same way, and an issue's line number is still the editor's.
+    func testEveryLineBreakFormSplitsAndLineNumbersHold() {
+        let report = ExclusionList.parseReport(
+            "\u{FEFF}bundle: com.a\rtitle: b\r\nnonsense\nbundle: com.c\u{2028}title: d")
+        XCTAssertEqual(report.list.rules.map(\.pattern), ["com.a", "b", "com.c", "d"])
+        XCTAssertEqual(report.issues.map(\.line), [3])
+        XCTAssertEqual(report.issues.first?.text, "nonsense")
+    }
+
     func testAddIsIdempotent() {
         var list = ExclusionList(rules: [])
         list.add(.init(kind: .bundleID, pattern: "com.a"))
