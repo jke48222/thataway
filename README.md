@@ -104,11 +104,11 @@ them is not a measurement at all.
 | --- | --- | --- |
 | Resolver latency | **0.067 ms p50, 0.081 ms p90** | `bench-data/axplan-chrome.json`, same run as the accuracy below |
 | Resolver accuracy | **12 of 12 on a Google Chrome window** | Same file, `ax_hit_rate: 1` over 12 plans |
-| Unit tests | **156 passing, 0 failures** | `swift test`, run 2026-09-27: 122 core, 28 Kit, 6 bench |
-| Source size | 8,381 lines across 34 Swift files | Sources 7,261, Tests 1,075, Package.swift 45 |
+| Unit tests | **217 passing, 0 failures** | `swift test`, run 2026-09-27: 128 core, 71 Kit, 18 bench |
+| Source size | 14,061 lines across 52 Swift files | Sources 11,191, Tests 2,806, Package.swift 64 (`wc -l`, 2026-09-27) |
 
-**On the source size:** the figure only clears 8,300 if you count the tests. The application and
-library code alone is 7,261 lines. Both numbers are in the table for that reason.
+**On the source size:** the total includes the tests. The application and library code alone is
+11,191 lines. Both numbers are in the table for that reason.
 
 ### The 12 of 12 is one Chrome window, and that matters
 
@@ -232,12 +232,18 @@ hypothetical.
 The fix has a property worth spelling out.
 [`AXCache.swift`](Sources/ScreenCoachKit/AXCache.swift) checks the exclusion rules **before the
 first accessibility call**, on the bundle identifier alone. **An app excluded by bundle is never
-touched through the accessibility API.** Title-pattern rules need a window title, which comes from
-`CGWindowList` first. macOS withholds other apps' window titles without Screen Recording
-permission, and failing open on a missing title would make every title rule inert. So for an app
-whose bundle is allowed, the cache also reads the focused window's `AXTitle` (at most three
-attribute reads, no tree walk) and checks it before walking. A tree whose own window title
-matches a rule is discarded before it is cached or served.
+touched through the accessibility API.** Title-pattern rules are checked against the window
+server's title from `CGWindowList`. macOS withholds other apps' window titles when Screen
+Recording is not granted, and failing open on a missing title would make every title rule inert.
+Only in that case does the cache read the focused window's `AXTitle` (at most three attribute
+reads, no tree walk) from an app whose bundle is already allowed, and check it before walking.
+With Screen Recording granted, no accessibility message reaches the app before the gate decides.
+A tree whose own window title matches a rule is discarded before it is cached or served.
+
+The vision fallback's frame holds only the target app's windows, so notification banners, widgets
+and other apps never reach the model. The frame goes to the local sidecar in memory, over its
+pipe. Only if the sidecar cannot take it that way is it written as a temp file readable by you
+alone, removed after the reply, and swept on the next start if a crash left it behind.
 
 [`ExclusionStore.swift`](Sources/ScreenCoachKit/ExclusionStore.swift) keeps the list at
 `~/.config/screencoach/exclusions.conf` as plain text, seeds it on first run so you can read what
@@ -261,7 +267,7 @@ recognition runs on device and the app refuses rather than sending audio to a se
 
 `ScreenCoachCore` imports only Foundation, CoreGraphics and Darwin. **No AppKit, no
 ApplicationServices, no ScreenCaptureKit.** That is enforced by what the module is allowed to
-contain rather than by convention, and it is why its 122 tests run in about fifteen milliseconds
+contain rather than by convention, and it is why its 128 tests run in about fifteen milliseconds
 with no permissions, no windows and no hardware.
 
 The parts most likely to be silently wrong live there deliberately: the multi-display coordinate
@@ -269,19 +275,22 @@ conversion, the latency budget arithmetic, the resolver's scoring, and the fusio
 
 | Test file | Count | What it covers |
 | --- | ---: | --- |
-| `FusionTests` | 34 | Combining tree and vision candidates, the confidence rules, exclusion parsing |
-| `LessonTests` | 22 | Steps, completion conditions, tree-diff detection |
-| `WorkflowInferenceTests` | 16 | Click hit-testing and turning clicks into semantic steps |
+| `FusionTests` | 37 | Combining tree and vision candidates, the confidence rules, exclusion parsing |
+| `LessonTests` | 23 | Steps, completion conditions, tree-diff detection |
+| `WorkflowInferenceTests` | 18 | Click hit-testing and turning clicks into semantic steps |
 | `LatencyTests` | 15 | Stage timing, percentiles, the budget as code |
 | `AXResolverTests` | 13 | Query to element ranking, and crop aiming on a miss |
 | `DisplaySpaceTests` | 11 | The multi-display coordinate trap, at the type level |
 | `PushToTalkTests` | 11 | Hold versus tap on hardware timestamps, and turn ordering |
 
-`ScreenCoachKit` has 28 tests for what runs without a display or a permission: the hotkey state
-machine, the capture exclusion plan, cache freshness, exclusion file reloads, lesson file limits,
-and the vision sidecar protocol against a stand-in Python script. Six more cover the bench CLI's
-`axplan` flags. The accessibility walk, capture, overlay drawing, voice and the app's turn logic
-have no unit tests. That is the real coverage gap.
+`ScreenCoachKit` has 71 tests for what runs without a display or a permission. They cover the
+hotkey state machine, the capture exclusion plan, cache freshness and event throttling, exclusion
+file reloads, lesson file limits, and the lesson runner's stall reporting and same-app check. They
+also drive the pointer's geometry, motion, contrast, badge and caption placement headless, pick the
+command bar's display, and run the vision sidecar protocol and process isolation against a
+stand-in Python script. Eighteen more cover the bench CLI's command parsing, its `axplan` flags
+and its exit status. The accessibility walk, capture, the overlay on
+a real display, voice and the app's turn logic have no unit tests. That is the real coverage gap.
 
 ## Running it
 
@@ -290,7 +299,7 @@ Swift dependencies.
 
 ```bash
 swift build -c release
-swift test                                  # 156 tests, headless, no permissions needed
+swift test                                  # 217 tests, headless, no permissions needed
 ./.build/release/screencoach-bench doctor    # environment and permission preflight
 ```
 
@@ -316,12 +325,27 @@ Reproduce the measurements:
 ./.build/release/screencoach-bench budget                                       # exits non-zero on violation
 ```
 
-The 0.067 ms resolver number needs no permissions, because it reads the committed Chrome snapshot:
+`screencoach-bench` with no arguments or with `--help` prints its usage and exits 0, and `all` runs
+only when named. The bench never walks an app on the exclusion list, and its captures leave those
+apps' windows out, the same as the app.
+
+The resolver result needs no permissions, because it reads the committed Chrome snapshot. Write the
+plan outside the repository, so the committed evidence file stays as it is, then compare:
 
 ```bash
 ./.build/release/screencoach-bench axplan --data bench-data/google-chrome.json --targets 12 \
-  --out bench-data/axplan-chrome.json
+  --out /tmp/axplan-chrome.json
 ```
+
+What reproduces is `ax_hit_rate: 1`, twelve exact hits over twelve plans, the same check CI runs.
+`resolve_p50_ms` and `resolve_p90_ms` are timings and move with the machine and its load, so expect
+the same order of magnitude as the committed 0.067 ms, not the same digits. Three rows will not match
+the committed `bench-data/axplan-chrome.json`, because the personal bookmark titles in the snapshot
+and the plan were replaced with placeholders after the run. The three bookmark queries, their scores
+and their aimed crops come out differently, and a fresh run reports 11 of 12 aimed crops containing
+the target where the committed plan has 12. The vision harnesses read the committed plans
+(`holo_axcrop.py` reads `axplan-chrome.json`, `live_eval.py` reads `google-chrome-axplan.json` beside
+the snapshot), so do not point `--out` into `bench-data/`.
 
 Test the whole turn without a human:
 
@@ -364,9 +388,9 @@ Sources/
 ├── ScreenCoachApp/        Menu bar app, hotkey, command bar, the resolve and point turn
 └── ScreenCoachBench/      screencoach-bench, 14 subcommands, every number in the findings
 
-Tests/ScreenCoachCoreTests/  122 tests, headless
-Tests/ScreenCoachKitTests/   28 tests, headless, no permissions
-Tests/ScreenCoachBenchTests/ 6 tests of the bench CLI's flags
+Tests/ScreenCoachCoreTests/  128 tests, headless
+Tests/ScreenCoachKitTests/   71 tests, headless, no permissions
+Tests/ScreenCoachBenchTests/ 18 tests of the bench CLI's commands, flags and exit status
 Tools/                       The Python vision harnesses and the app packaging script
 bench-data/                  Committed benchmark output, the source of every figure above
 PHASE-0-FINDINGS.md          The engineering log, 23 findings across phases 0 to 4
@@ -402,9 +426,10 @@ not committed. Thin arm64, bundle `com.funproject.screencoach`, version 0.1.0, a
   beside the model, then the usual install locations.
 - **Not notarized**, and the build has no hardened runtime, because the signing script fell back
   from Developer ID to an Apple Development identity. Gatekeeper will reject it on another Mac.
-- **The system-facing code is mostly untested.** Kit's 28 tests cover its policies and its
-  file and process plumbing; the accessibility walk, capture, overlay, voice and the app's turn
-  logic are checked by hand and by the `--selftest` harness only.
+- **The system-facing code is mostly untested.** Kit's 71 tests cover its policies, its file and
+  process plumbing, the lesson runner's stall handling and the pointer's layers driven headless. The
+  accessibility walk, capture, the overlay on a real display, voice and the app's turn logic
+  are checked by hand and by the `--selftest` harness only.
 - **Every headline accuracy figure comes from one Chrome window with twelve targets.** A second
   app, ideally a dense one, is the highest-value next measurement.
 - **No screenshot or demo clip exists.** For a project whose entire output is a cursor arcing to a

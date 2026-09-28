@@ -51,14 +51,17 @@ jobs:
       - name: Test
         run: swift test
 
-      # The vision sidecar's protocol and its no-frame-on-disk guarantee, with mlx_vlm stubbed out.
-      # Needs only Pillow, installed into a throwaway venv so the runner's Python is left alone.
-      - name: Test the vision sidecar
+      # The vision sidecar's protocol and its no-frame-on-disk guarantee, with mlx_vlm stubbed out,
+      # and make-app.sh's bundle (sidecar copied in, valid Info.plist, entitlements on every signing
+      # branch) with swift, security and codesign stubbed. Needs only Pillow and plutil; Pillow goes
+      # into a throwaway venv so the runner's Python is left alone.
+      - name: Test the vision sidecar and app bundling
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pillow
           "$RUNNER_TEMP/venv/bin/python" -B Tools/tests/test_holo_server.py
+          "$RUNNER_TEMP/venv/bin/python" -B Tools/tests/test_make_app.py
 
       # Environment and permission preflight. Exits 0 with permissions reported as DENIED on a
       # runner, which is expected; this step proves the release binary launches.

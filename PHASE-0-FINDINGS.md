@@ -471,8 +471,14 @@ python3 Tools/holo_sweep.py --data bench-data/logic-pro.json --targets 10
 
 ```bash
 ./.build/release/screencoach-bench axplan --data bench-data/google-chrome.json --targets 12 \
-  --out bench-data/axplan-chrome.json
+  --out /tmp/axplan-chrome.json
 ```
+
+This writes outside the repository so the committed `bench-data/axplan-chrome.json`, which the
+next command reads, is never overwritten; `live_eval.py` likewise reads the committed
+`bench-data/google-chrome-axplan.json` beside the snapshot. A fresh run reproduces the 12/12 hit
+rate; the timings vary by machine, and the three bookmark rows differ because their titles were
+replaced with placeholders in the snapshot and the plan after the run.
 
 ```bash
 cd Tools && python3 holo_axcrop.py --data ../bench-data/google-chrome.json --plan ../bench-data/axplan-chrome.json
@@ -633,9 +639,13 @@ No frame was ever captured, and a private conversation leaked anyway — an
 accessibility tree carries the content, not merely the controls.
 
 So exclusion now means excluded: **no capture and no tree**, checked before the
-first AX call. Title-pattern rules are evaluated against the window title from
-`CGWindowList` rather than AX, so testing whether an app is excluded never
-requires reading the app.
+first AX call. Title-pattern rules are evaluated against the window server's
+title from `CGWindowList`. Only when Screen Recording is not granted, so the
+window server withholds titles, is the focused window's `AXTitle` read, as one
+attribute of an app whose bundle is already allowed. The vision frame holds only
+the target app's windows, so banners, widgets and other apps never reach the
+model, and it reaches the sidecar in memory, or as a 0600 temp file removed
+after the reply and swept on the next start.
 
 The trade is real and correct: the coach cannot help you inside your password
 manager.
