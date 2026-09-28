@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds ScreenCoach.app — an LSUIElement (menu-bar-only) accessory app.
+# Builds Thataway.app — an LSUIElement (menu-bar-only) accessory app.
 #
 # Signing identity matters more than usual here. Accessibility is a TCC
 # permission keyed to the code signature, so an ad-hoc signed build asks for
@@ -9,20 +9,20 @@
 #
 # The hardened runtime blocks the microphone unless the signature carries
 # com.apple.security.device.audio-input, so every branch below signs with
-# Tools/ScreenCoach.entitlements.
+# Tools/Thataway.entitlements.
 #
 # Shipping later needs Developer ID + hardened runtime + notarization:
-#   xcrun notarytool submit build/ScreenCoach.zip --keychain-profile <p> --wait
-#   xcrun stapler staple build/ScreenCoach.app
+#   xcrun notarytool submit build/Thataway.zip --keychain-profile <p> --wait
+#   xcrun stapler staple build/Thataway.app
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 swift build -c release >/dev/null
-APP=build/ScreenCoach.app
-ENTITLEMENTS=Tools/ScreenCoach.entitlements
+APP=build/Thataway.app
+ENTITLEMENTS=Tools/Thataway.entitlements
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Tools"
-cp .build/release/ScreenCoachApp "$APP/Contents/MacOS/ScreenCoach"
+cp .build/release/ThatawayApp "$APP/Contents/MacOS/Thataway"
 
 # The vision sidecar. App.toolsDirectory looks in Contents/Resources/Tools
 # first; without this the bundle only works on the machine that built it,
@@ -38,10 +38,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>ScreenCoach</string>
-  <key>CFBundleDisplayName</key><string>Screen Coach</string>
-  <key>CFBundleIdentifier</key><string>com.funproject.screencoach</string>
-  <key>CFBundleExecutable</key><string>ScreenCoach</string>
+  <key>CFBundleName</key><string>Thataway</string>
+  <key>CFBundleDisplayName</key><string>Thataway</string>
+  <key>CFBundleIdentifier</key><string>com.jalenedusei.thataway</string>
+  <key>CFBundleExecutable</key><string>Thataway</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>

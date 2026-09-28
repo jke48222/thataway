@@ -4,7 +4,7 @@ Machine: **Apple M5 Pro, 24 GB unified, macOS 27.0 (26A5378j)**, single
 1512×982 @2x display. Swift 6.3.3, MLX 0.32.1.
 
 Everything below is measured on this machine with
-`Sources/ScreenCoachBench`. Percentiles are nearest-rank over the stated trial
+`Sources/ThatawayBench`. Percentiles are nearest-rank over the stated trial
 count, so every figure is a number some trial actually produced.
 
 ---
@@ -462,7 +462,7 @@ swift test && swift build -c release
 ```
 
 ```bash
-./.build/release/screencoach-bench all --deadline 2000
+./.build/release/thataway-bench all --deadline 2000
 ```
 
 ```bash
@@ -470,7 +470,7 @@ python3 Tools/holo_sweep.py --data bench-data/logic-pro.json --targets 10
 ```
 
 ```bash
-./.build/release/screencoach-bench axplan --data bench-data/google-chrome.json --targets 12 \
+./.build/release/thataway-bench axplan --data bench-data/google-chrome.json --targets 12 \
   --out /tmp/axplan-chrome.json
 ```
 
@@ -488,7 +488,7 @@ Not yet run — needs a human at the keyboard, since it times real key presses
 from the hardware event timestamp:
 
 ```bash
-./.build/release/screencoach-bench hotkey --trials 10
+./.build/release/thataway-bench hotkey --trials 10
 ```
 
 Raw results are in `bench-data/`: `holo-7b-bf16.json`, `holo-7b-4bit.json`,
@@ -498,7 +498,7 @@ Raw results are in `bench-data/`: `holo-7b-bf16.json`, `holo-7b-4bit.json`,
 
 # Phase 1 — It points, correctly
 
-Built: `ScreenCoachApp` — a menu-bar-only accessory app. Hotkey (⌥Space), type a
+Built: `ThatawayApp` — a menu-bar-only accessory app. Hotkey (⌥Space), type a
 target in plain language, and a cursor flies along a bezier arc to the exact
 control. **No voice, no vision model, no cloud, no network at all.**
 
@@ -576,14 +576,14 @@ app the user was working in, not the input box they are typing into.
 ## Running it
 
 ```bash
-bash Tools/make-app.sh && open build/ScreenCoach.app
+bash Tools/make-app.sh && open build/Thataway.app
 ```
 
 Then ⌥Space. Grant Accessibility when asked — it is the entire product; without
 it there is nothing to point at.
 
 ```bash
-./build/ScreenCoach.app/Contents/MacOS/ScreenCoach --selftest "the Today button" --app Calendar
+./build/Thataway.app/Contents/MacOS/Thataway --selftest "the Today button" --app Calendar
 ```
 
 Sign with a **stable identity**. Accessibility is TCC-keyed to the code
@@ -694,7 +694,7 @@ vision model it triggered.
 
 ## Live reload, verified rather than asserted
 
-`screencoach-bench exclusions` watches the file in a running process:
+`thataway-bench exclusions` watches the file in a running process:
 
 ```
 26 apps, 16 title patterns excluded
@@ -705,7 +705,7 @@ reload #3: 42 rules — Calendar allowed
 
 An edit takes effect before the next query, with no restart. A privacy control
 that needs a relaunch is one nobody uses. The file is plain text at
-`~/.config/screencoach/exclusions.conf`, seeded with the defaults on first run
+`~/.config/thataway/exclusions.conf`, seeded with the defaults on first run
 so what is excluded can be read rather than trusted. An empty or unparseable
 file falls back to the defaults, never to "allow everything".
 
@@ -748,7 +748,7 @@ the point of drawing the dashes.
 
 ## Finding 17 — The latency budget as a CI gate, and an honest unmeasured list
 
-`screencoach-bench budget` measures each stage against `LatencyBudget` and
+`thataway-bench budget` measures each stage against `LatencyBudget` and
 exits non-zero on violation:
 
 ```

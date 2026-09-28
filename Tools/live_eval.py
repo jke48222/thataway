@@ -67,7 +67,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=str(Path.home() / "models/holo1.5-7b-4bit"))
     ap.add_argument("--snapshots", nargs="+", required=True,
-                    help="snapshot JSONs from `screencoach-bench snap`")
+                    help="snapshot JSONs from `thataway-bench snap`")
     ap.add_argument("--plans", nargs="*", default=[],
                     help="matching axplan JSONs, in the same order as --snapshots")
     ap.add_argument("--out", default="bench-data/live-eval.json")
@@ -95,7 +95,7 @@ def main():
             if not plan_path.exists():
                 plan_path = root / f"axplan-{Path(snap_path).stem}.json"
         if not plan_path.exists():
-            print(f"  !! no axplan beside {snap_path}; run `screencoach-bench axplan` first")
+            print(f"  !! no axplan beside {snap_path}; run `thataway-bench axplan` first")
             continue
         plan = json.loads(plan_path.read_text())
         image = Image.open(root / snap["image"]).convert("RGB")

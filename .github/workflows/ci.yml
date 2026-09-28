@@ -1,10 +1,10 @@
-# Builds ScreenCoach and runs the unit tests on every push and pull request to main.
+# Builds Thataway and runs the unit tests on every push and pull request to main.
 #
 # Runner: macos-26 (Apple silicon) is the newest generally available macOS image. We stay on the
 # newest *stable* Xcode that setup-xcode finds. The package targets macOS 14 with
 # swift-tools-version 5.9 and uses no SDK-gated APIs, so any Xcode 16 or later builds it.
 #
-# What CI deliberately does not run: every screencoach-bench subcommand that reads the
+# What CI deliberately does not run: every thataway-bench subcommand that reads the
 # accessibility tree, captures the screen, draws an overlay or moves the pointer (ax, coldwarm,
 # capture, budget, windows, and the rest), and the app's --selftest and --idlebench modes. They
 # need Accessibility and Screen Recording grants and a live app to measure, and a hosted runner has
@@ -66,7 +66,7 @@ jobs:
       # Environment and permission preflight. Exits 0 with permissions reported as DENIED on a
       # runner, which is expected; this step proves the release binary launches.
       - name: Bench doctor
-        run: ./.build/release/screencoach-bench doctor
+        run: ./.build/release/thataway-bench doctor
 
       # The README's resolver numbers come from this command. It reads only the committed
       # Chrome snapshot, so it is headless, and the check fails the job if the plan is not
@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/axplan-chrome.json"
-          ./.build/release/screencoach-bench axplan \
+          ./.build/release/thataway-bench axplan \
             --data bench-data/google-chrome.json --targets 12 --out "$out"
           python3 - "$out" <<'PY'
           import json, sys

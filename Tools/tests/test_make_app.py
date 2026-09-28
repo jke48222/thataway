@@ -40,10 +40,10 @@ class MakeAppBundle(unittest.TestCase):
         (repo / "Tools").mkdir(parents=True)
         (repo / ".build/release").mkdir(parents=True)
         bin_dir.mkdir()
-        for f in ["make-app.sh", "ScreenCoach.entitlements", *(
+        for f in ["make-app.sh", "Thataway.entitlements", *(
                 p.name for p in TOOLS.glob("*.py"))]:
             shutil.copy(TOOLS / f, repo / "Tools" / f)
-        (repo / ".build/release/ScreenCoachApp").write_text("binary")
+        (repo / ".build/release/ThatawayApp").write_text("binary")
         for name, body in [("swift", STUB_SWIFT), ("codesign", STUB_CODESIGN),
                            ("security", stub_security(identity))]:
             p = bin_dir / name
@@ -55,7 +55,7 @@ class MakeAppBundle(unittest.TestCase):
         subprocess.run(["bash", "Tools/make-app.sh"], cwd=repo, env=env,
                        check=True, capture_output=True, text=True)
         self.repo = repo
-        self.app = repo / "build/ScreenCoach.app"
+        self.app = repo / "build/Thataway.app"
         self.codesign = log.read_text().splitlines()
 
     def test_sidecar_ships_in_resources_tools(self):
@@ -82,11 +82,11 @@ class MakeAppBundle(unittest.TestCase):
         self.build(identity="Developer ID Application: Test (XYZ)")
         sign = next(l for l in self.codesign if "--sign" in l)
         self.assertIn("--options runtime", sign)
-        self.assertIn("--entitlements Tools/ScreenCoach.entitlements", sign)
+        self.assertIn("--entitlements Tools/Thataway.entitlements", sign)
         # The key contains dots, which `plutil -extract` reads as a key path.
         ent = json.loads(subprocess.run(
             ["plutil", "-convert", "json", "-o", "-",
-             str(self.repo / "Tools/ScreenCoach.entitlements")],
+             str(self.repo / "Tools/Thataway.entitlements")],
             check=True, capture_output=True, text=True).stdout)
         self.assertIs(ent.get("com.apple.security.device.audio-input"), True)
 
@@ -95,7 +95,7 @@ class MakeAppBundle(unittest.TestCase):
             with self.subTest(identity=identity):
                 self.build(identity=identity)
                 sign = next(l for l in self.codesign if "--sign" in l)
-                self.assertIn("--entitlements Tools/ScreenCoach.entitlements", sign)
+                self.assertIn("--entitlements Tools/Thataway.entitlements", sign)
 
 
 if __name__ == "__main__":

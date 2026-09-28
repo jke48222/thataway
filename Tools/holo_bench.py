@@ -12,7 +12,7 @@ published figure for this hardware:
   3. Does cropping to the window instead of feeding the whole display help,
      which is the specific claim the fallback design rests on.
 
-Ground truth comes from `screencoach-bench snap`, which writes a window PNG,
+Ground truth comes from `thataway-bench snap`, which writes a window PNG,
 a full-display PNG, and the AX bounds of every labelled actionable element in
 both pixel frames. A prediction counts as a hit when the predicted click lands
 inside the element's real box — the same criterion ScreenSpot-Pro uses.
