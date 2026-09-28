@@ -30,10 +30,21 @@ public enum ScreenGrab {
     /// subtraction and a single scale, verified pixel-exact on both Logic Pro
     /// and Chrome.
     ///
-    /// Display scope means other apps' windows are in the frame, so the
-    /// exclusion list is applied here, to the capture itself, and not only
-    /// to the app in front. Removed from the frame, before any pixel exists:
+    /// With a `targetPID` (the app's vision path) the frame holds that app's
+    /// windows and nothing else: display framing, so the AX→pixel mapping is
+    /// unchanged, but every other process's pixels are left out. That
+    /// includes content an excluded app does not draw itself: a Messages or
+    /// Mail banner is a Notification Center window, and desktop widgets are
+    /// drawn by system hosts, so no bundle rule for the app that posted them
+    /// could ever match. The target's own windows whose titles match a title
+    /// rule are cut out as well.
+    ///
+    /// Without a `targetPID` (the bench), the whole display is captured and
+    /// the exclusion list is applied to the capture itself. Removed from the
+    /// frame, before any pixel exists:
     ///   * every app whose bundle ID matches a bundle rule,
+    ///   * the system processes that draw other apps' content (notification
+    ///     banners, desktop widgets), whatever the rules say,
     ///   * every window whose title matches a title rule (titles are read
     ///     fresh from the window server, not from a cached tree),
     ///   * the coach's own windows. The overlay may already be showing a
@@ -91,7 +102,19 @@ public enum ScreenGrab {
                 return
             }
             let filter: SCContentFilter
-            if plan.excludedWindowIDs.isEmpty {
+            if let targetPID {
+                // Only the target app. An app missing from the shareable
+                // content cannot be captured, and a whole-display fallback
+                // would bring back everything this is meant to leave out.
+                guard let app = content.applications.first(where: {
+                    $0.processID == targetPID
+                }) else { return }
+                filter = SCContentFilter(
+                    display: display, including: [app],
+                    exceptingWindows: content.windows.filter {
+                        plan.excludedWindowIDs.contains($0.windowID)
+                    })
+            } else if plan.excludedWindowIDs.isEmpty {
                 // `excludingApplications` removes every window of those apps,
                 // including one that opens after the content was listed.
                 filter = SCContentFilter(
@@ -145,14 +168,31 @@ public enum ScreenGrab {
         var excludedWindowIDs: Set<CGWindowID>
     }
 
+    /// System processes that draw other apps' content in windows of their
+    /// own: notification banners and alerts (the Notification Center UI,
+    /// which also hosts desktop widgets, and the older user notification
+    /// alert host) and widget extension hosts. A banner from an excluded app
+    /// shows its sender and message text, but its window belongs to one of
+    /// these, so no rule for the posting app can match it. Always cut from a
+    /// display frame, the same way the coach's own windows always are.
+    static let systemContentHosts: Set<String> = [
+        "com.apple.notificationcenterui",
+        "com.apple.usernotificationcenter",
+        "com.apple.chronod",
+    ]
+
     /// Which apps and windows must not appear in a frame. Pure, so the policy
     /// can be tested without a display.
     static func exclusionPlan(apps: [AppInfo], windows: [WindowInfo],
                               exclusions: ExclusionList, ownPID: pid_t) -> Plan {
         var pids = Set<pid_t>([ownPID])
-        for app in apps where exclusions.check(bundleID: app.bundleID,
-                                               windowTitle: nil).excluded {
-            pids.insert(app.pid)
+        for app in apps {
+            let bundle = app.bundleID.lowercased()
+            if systemContentHosts.contains(bundle)
+                || bundle.hasPrefix("com.apple.widgetkit.")
+                || exclusions.check(bundleID: app.bundleID, windowTitle: nil).excluded {
+                pids.insert(app.pid)
+            }
         }
         var windowIDs = Set<CGWindowID>()
         for w in windows {

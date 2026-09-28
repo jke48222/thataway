@@ -24,6 +24,17 @@ import ScreenCoachCore
 ///   * Writes to the sidecar never raise SIGPIPE. A sidecar that died between
 ///     queries (jetsam, an MLX crash) makes the write fail with EPIPE, which
 ///     is handled, instead of killing the coach.
+///
+/// And two keep it from becoming a privacy hole:
+///   * The sidecar is spawned with responsibility disclaimed
+///     (`SidecarProcess`), in isolated mode, with a minimal environment. It
+///     does not inherit the coach's Accessibility, Screen Recording or
+///     Microphone grants, so whichever interpreter runs gets nothing the
+///     user's own shell does not already have.
+///   * No frame touches the disk when the sidecar can take the image inline.
+///     With an older sidecar the frame goes to a 0600 file that is removed
+///     when the answer comes back, and any frame a crash or force quit left
+///     behind is swept at the next start and before every write.
 public final class GroundingService {
 
     public struct Result {
@@ -46,12 +57,17 @@ public final class GroundingService {
     }
 
     private var currentState: State = .notStarted
-    private var process: Process?
-    private var toChild: FileHandle?
+    private var process: SidecarProcess?
     private var fromChildFD: Int32 = -1
-    private var stdoutHandle: FileHandle?
-    private var stderrHandle: FileHandle?
+    private var stderrSource: DispatchSourceRead?
     private var stderrTail = Data()
+    /// Whether the running sidecar said it takes the frame inline
+    /// (`"inline_image": true` in its ready line), so no frame file exists.
+    private var sidecarTakesInlineImage = false
+    private var lastFailureReason: String?
+    /// Grounding calls in progress, so `shutdown()` can let each one finish
+    /// deleting its frame before the process exits.
+    private let inFlight = DispatchGroup()
     private let lock = NSLock()
     private var nextID = 1
     /// After a launch failure, when the next launch may be attempted. A
@@ -63,6 +79,11 @@ public final class GroundingService {
     private let serverScript: URL
     private let modelPath: String
     private let scratch: URL
+
+    /// A frame file older than this cannot belong to a call still in
+    /// progress anywhere (every call ends by `timeout`), so it is left over
+    /// from a crash or force quit and is deleted.
+    var staleFrameAge: TimeInterval { max(60, timeout * 2) }
 
     /// Hard ceiling on one grounding call. Measured worst case is ~7 s on a
     /// full frame; beyond 20 s something is wrong and the user should get an
@@ -92,13 +113,29 @@ public final class GroundingService {
     public static let pythonDefaultsKey = "pythonPath"
     public static let pythonEnvironmentKey = "SCREENCOACH_PYTHON"
 
-    public init(serverScript: URL, modelPath: String) {
+    public convenience init(serverScript: URL, modelPath: String) {
+        self.init(serverScript: serverScript, modelPath: modelPath, scratchDirectory: nil)
+    }
+
+    /// `scratchDirectory` is a seam for tests; the app uses the default,
+    /// `$TMPDIR/screencoach-frames`, which is inside the per-user 0700
+    /// temporary directory.
+    init(serverScript: URL, modelPath: String, scratchDirectory: URL?) {
         self.serverScript = serverScript
         self.modelPath = modelPath
-        self.scratch = FileManager.default.temporaryDirectory
+        self.scratch = scratchDirectory ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("screencoach-frames", isDirectory: true)
-        try? FileManager.default.createDirectory(at: scratch,
-                                                 withIntermediateDirectories: true)
+        // A frame a crash, force quit or power loss left behind from an
+        // earlier run goes now, not whenever the OS next clears tmp.
+        _ = prepareScratch()
+    }
+
+    /// Why the last `ground` call returned nil, in words the status line can
+    /// show: a frame that could not be written reads differently from a model
+    /// that looked and found nothing. Nil after a call that succeeded.
+    public var lastFailure: String? {
+        lock.lock(); defer { lock.unlock() }
+        return lastFailureReason
     }
 
     public var isReady: Bool {
@@ -142,49 +179,53 @@ public final class GroundingService {
             return false
         }
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: python)
-        p.arguments = [serverScript.path, modelPath]
-        // Never write bytecode next to the script: inside a signed bundle a
-        // __pycache__ would break the seal. holo_server.py also turns it off
-        // itself; this covers anything imported before that line runs.
-        p.environment = ProcessInfo.processInfo.environment
-            .merging(["PYTHONDONTWRITEBYTECODE": "1"]) { $1 }
-        let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
-        p.standardInput = inPipe
-        p.standardOutput = outPipe
-        p.standardError = errPipe
-
-        // The write end must report EPIPE rather than raise SIGPIPE, whose
-        // default action would terminate the whole app.
-        _ = fcntl(inPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        // Disclaimed, isolated and with a minimal environment: see
+        // `SidecarProcess`. `-I` ignores PYTHONPATH, PYTHONHOME,
+        // PYTHONSTARTUP and user site-packages; holo_server.py adds its own
+        // directory to sys.path itself. `-B` because `-I` also ignores
+        // PYTHONDONTWRITEBYTECODE, and inside a signed bundle a __pycache__
+        // written next to the script would break the seal.
+        let p: SidecarProcess
+        do {
+            p = try SidecarProcess.spawn(
+                executable: python,
+                arguments: Self.interpreterFlags + [serverScript.path, modelPath],
+                environment: SidecarProcess.minimalEnvironment(
+                    from: ProcessInfo.processInfo.environment,
+                    adding: ["PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1"]))
+        } catch {
+            failLaunch("could not launch \(python): \(error)")
+            return false
+        }
 
         // Keep the tail of stderr so a failure can say why. Draining it also
         // stops a chatty library from filling the pipe and blocking the child.
-        errPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let chunk = h.availableData
+        let errFD = p.stderrFD
+        let source = DispatchSource.makeReadSource(fileDescriptor: errFD,
+                                                   queue: .global(qos: .utility))
+        source.setEventHandler { [weak self, weak source] in
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = buf.withUnsafeMutableBytes { read(errFD, $0.baseAddress, $0.count) }
+            guard n > 0 else {
+                if n == 0 || (errno != EINTR && errno != EAGAIN) { source?.cancel() }
+                return
+            }
             guard let self else { return }
-            if chunk.isEmpty { h.readabilityHandler = nil; return }
             self.lock.lock()
-            self.stderrTail.append(chunk)
+            self.stderrTail.append(contentsOf: buf[0..<n])
             if self.stderrTail.count > 4096 {
                 self.stderrTail.removeFirst(self.stderrTail.count - 4096)
             }
             self.lock.unlock()
         }
+        source.resume()
 
-        do { try p.run() } catch {
-            errPipe.fileHandleForReading.readabilityHandler = nil
-            failLaunch("could not launch \(python): \(error.localizedDescription)")
-            return false
-        }
         lock.lock()
         process = p
-        toChild = inPipe.fileHandleForWriting
-        stdoutHandle = outPipe.fileHandleForReading
-        stderrHandle = errPipe.fileHandleForReading
-        fromChildFD = outPipe.fileHandleForReading.fileDescriptor
+        stderrSource = source
+        fromChildFD = p.stdoutFD
         stderrTail.removeAll()
+        sidecarTakesInlineImage = false
         lock.unlock()
 
         switch readLine(matching: nil, timeout: loadTimeout) {
@@ -193,6 +234,7 @@ public final class GroundingService {
                 lock.lock()
                 currentState = .ready(model: hello["model"] as? String ?? modelPath,
                                       loadSeconds: hello["load_s"] as? Double ?? 0)
+                sidecarTakesInlineImage = hello["inline_image"] as? Bool ?? false
                 retryNotBefore = nil
                 lock.unlock()
                 return true
@@ -212,18 +254,24 @@ public final class GroundingService {
     /// own (it finishes the request in hand and exits on quit or EOF), and
     /// only then terminate it. Killing it mid-request is the fallback, not
     /// the plan.
+    ///
+    /// A grounding call in progress is also given until the same deadline to
+    /// return, so its frame file (if any) is deleted before the app exits
+    /// rather than left in $TMPDIR.
     public func shutdown(grace: TimeInterval = 2) {
-        // Take the handle so no request can start writing to it while it is
-        // being closed.
-        lock.lock(); let handle = toChild; toChild = nil; let p = process; lock.unlock()
-        if let handle, let p, p.isRunning {
+        let deadline = Date().addingTimeInterval(grace)
+        lock.lock(); let p = process; lock.unlock()
+        if let p, p.isRunning {
             // No SIGPIPE: the descriptor is set to fail with EPIPE instead.
-            try? handle.write(contentsOf: Data("{\"op\":\"quit\"}\n".utf8))
-            try? handle.close()
-            let deadline = Date().addingTimeInterval(grace)
-            while p.isRunning && Date() < deadline { usleep(50_000) }
+            _ = p.writeToStdin(Data("{\"op\":\"quit\"}\n".utf8),
+                               deadline: Date().addingTimeInterval(0.2))
+            // EOF also tells the sidecar to finish the request in hand and
+            // exit, which in turn ends a `ground` call waiting on it.
+            p.closeStdin()
+            _ = p.waitForExit(timeout: max(0, deadline.timeIntervalSinceNow))
         }
         teardown(state: .notStarted)
+        _ = inFlight.wait(timeout: .now() + max(0.1, deadline.timeIntervalSinceNow))
     }
 
     deinit { shutdown() }
@@ -239,7 +287,10 @@ public final class GroundingService {
     public func ground(image: CGImage, query: String, cropPixels: CGRect?,
                        screenIndex: Int, displayScale: CGFloat,
                        displayOrigin: CGPoint) -> Result? {
-        guard isReady else { return nil }
+        inFlight.enter()
+        defer { inFlight.leave() }   // declared first, so it runs last
+        setFailure(nil)
+        guard isReady else { return fail("vision is not running") }
 
         // Crop here rather than in the sidecar. Encoding a 5K frame costs
         // ~90 ms and decoding it again another ~65 ms, for pixels the model
@@ -253,33 +304,58 @@ public final class GroundingService {
             offset = c.origin
         }
 
-        let frameURL = scratch.appendingPathComponent("frame-\(UUID().uuidString).png")
-        guard write(sent, to: frameURL) else { return nil }
-        // The frame is deleted the moment the answer comes back, or the
-        // moment the attempt is abandoned. Nothing is persisted by default —
-        // that is the headline privacy claim and it has to be true in the
-        // code, not only in the README.
-        defer { try? FileManager.default.removeItem(at: frameURL) }
-
         lock.lock()
         let id = nextID; nextID += 1
-        let handle = toChild
-        let alive = process?.isRunning == true
+        let p = process
+        let inline = sidecarTakesInlineImage
         lock.unlock()
-        guard alive, let handle else {
+        guard let p, p.isRunning else {
             teardown(state: .notStarted)
-            return nil
+            return fail("the vision sidecar had exited; it restarts on the next miss")
         }
 
-        let request: [String: Any] = ["id": id, "image": frameURL.path, "query": query]
-        guard let data = try? JSONSerialization.data(withJSONObject: request) else { return nil }
-        do {
-            try handle.write(contentsOf: data + Data("\n".utf8))
-        } catch {
+        guard let png = Self.pngData(sent) else {
+            return fail("could not encode the screen frame")
+        }
+
+        // Nothing is persisted by default: that is the headline privacy
+        // claim and it has to be true in the code, not only in the README.
+        // A sidecar that takes the image inline gets the bytes over the pipe
+        // and no path ever exists. An older one gets a 0600 file that is
+        // deleted the moment the answer comes back or the attempt is
+        // abandoned; one left by a crash is swept by the next write or start.
+        var request: [String: Any] = ["id": id, "query": query]
+        var frameURL: URL?
+        if inline {
+            request["image_png_b64"] = png.base64EncodedString()
+        } else {
+            switch writeFrame(png) {
+            case .success(let url):
+                frameURL = url
+                request["image"] = url.path
+            case .failure(let why):
+                NSLog("ScreenCoach: \(why)")
+                return fail(why)
+            }
+        }
+        defer { if let frameURL { try? FileManager.default.removeItem(at: frameURL) } }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: request) else {
+            return fail("could not encode the request")
+        }
+        switch p.writeToStdin(data + Data("\n".utf8),
+                              deadline: Date().addingTimeInterval(timeout)) {
+        case .written:
+            break
+        case .timedOut:
+            teardown(state: .failed(String(format: "stopped reading requests for %.0f s; "
+                                           + "restarts on the next miss", timeout)))
+            return fail("the vision sidecar stopped responding")
+        case .closed:
             // EPIPE: the sidecar is gone. The next miss starts a new one.
             teardown(state: .failed("sidecar exited" + stderrSuffix()
                                     + "; restarts on the next miss"))
-            return nil
+            return fail("the vision sidecar exited")
         }
 
         let response: [String: Any]
@@ -293,19 +369,26 @@ public final class GroundingService {
                          + "restarting the sidecar on the next miss", timeout))
             teardown(state: .failed(String(format: "timed out after %.0f s; "
                                            + "restarts on the next miss", timeout)))
-            return nil
+            return fail(String(format: "the vision model took longer than %.0f s", timeout))
         case .eof:
             teardown(state: .failed("sidecar exited" + stderrSuffix()
                                     + "; restarts on the next miss"))
-            return nil
+            return fail("the vision sidecar exited")
         }
 
         if let error = response["error"] as? String {
             NSLog("ScreenCoach: grounding failed: \(error)")
-            return nil
+            return fail("the vision model found nothing")
         }
-        guard let rx = response["x"] as? Double, let ry = response["y"] as? Double else {
-            return nil
+        guard let rx = (response["x"] as? NSNumber)?.doubleValue,
+              let ry = (response["y"] as? NSNumber)?.doubleValue else {
+            return fail("the vision model found nothing")
+        }
+        // The model reads on-screen text, so what a page shows can steer its
+        // reply. A point outside the image it was sent is not an answer.
+        guard Self.pointIsInside(x: rx, y: ry, width: sent.width, height: sent.height) else {
+            NSLog("ScreenCoach: discarding a vision answer outside the frame")
+            return fail("the vision model's answer was outside the screen")
         }
         let px = rx + Double(offset.x), py = ry + Double(offset.y)
 
@@ -362,6 +445,11 @@ public final class GroundingService {
             defaultsValue: UserDefaults.standard.string(forKey: Self.pythonDefaultsKey),
             modelPath: modelPath)
         for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
+            guard Self.isTrustworthyExecutable(c) else {
+                NSLog("ScreenCoach: not using \(c): it, or a folder above it, "
+                      + "can be changed by other users")
+                continue
+            }
             if interpreterProbe(c) {
                 lock.lock(); resolvedPython = c; lock.unlock()
                 return c
@@ -373,32 +461,136 @@ public final class GroundingService {
     /// Asks an interpreter whether it can import what the sidecar needs,
     /// without importing it: `find_spec` answers in tens of milliseconds
     /// where importing MLX takes seconds.
+    ///
+    /// Spawned exactly like the sidecar (disclaimed, isolated, minimal
+    /// environment), so the probe runs nothing with the coach's grants and
+    /// answers for the same module search path the sidecar will have.
     static func hasVisionModules(_ python: String) -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: python)
-        p.arguments = ["-c", "import importlib.util as u, sys; "
-                       + "sys.exit(0 if u.find_spec('mlx_vlm') and u.find_spec('PIL') else 1)"]
-        p.standardInput = FileHandle.nullDevice
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        let done = DispatchSemaphore(value: 0)
-        p.terminationHandler = { _ in done.signal() }
-        do { try p.run() } catch { return false }
-        if done.wait(timeout: .now() + 10) == .timedOut {
-            p.terminate()
+        guard let p = try? SidecarProcess.spawn(
+            executable: python,
+            arguments: interpreterFlags + [
+                "-c", "import importlib.util as u, sys; "
+                    + "sys.exit(0 if u.find_spec('mlx_vlm') and u.find_spec('PIL') else 1)"],
+            environment: SidecarProcess.minimalEnvironment(
+                from: ProcessInfo.processInfo.environment)) else { return false }
+        p.closeStdin()
+        defer { p.closeAll() }
+        guard let status = p.waitForExit(timeout: 10) else {
+            p.terminate(grace: 0.5)
             return false
         }
-        return p.terminationStatus == 0
+        return status == 0
+    }
+
+    /// Isolated mode, and no bytecode written anywhere.
+    static let interpreterFlags = ["-I", "-B"]
+
+    /// Whether an interpreter may be run at all: the file, what it links to,
+    /// and every folder above both are owned by this user or by root and
+    /// cannot be written by everyone. An interpreter in a shared folder such
+    /// as /tmp could be swapped by another account between two queries.
+    static func isTrustworthyExecutable(_ path: String) -> Bool {
+        let me = getuid()
+        func ok(_ p: String) -> Bool {
+            var st = stat()
+            guard lstat(p, &st) == 0 else { return false }
+            return (st.st_uid == me || st.st_uid == 0) && st.st_mode & S_IWOTH == 0
+        }
+        func chainOK(_ p: String) -> Bool {
+            guard p.hasPrefix("/") else { return false }
+            var current = (p as NSString).standardizingPath
+            while true {
+                guard ok(current) else { return false }
+                if current == "/" { return true }
+                current = (current as NSString).deletingLastPathComponent
+                if current.isEmpty { return false }
+            }
+        }
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        return chainOK(path) && chainOK(resolved)
+    }
+
+    /// A reply's point lies on the image that was sent.
+    static func pointIsInside(x: Double, y: Double, width: Int, height: Int) -> Bool {
+        x.isFinite && y.isFinite && x >= 0 && y >= 0
+            && x <= Double(width) && y <= Double(height)
     }
 
     // MARK: - Plumbing
 
-    private func write(_ image: CGImage, to url: URL) -> Bool {
-        guard let dest = CGImageDestinationCreateWithURL(
-            url as CFURL, "public.png" as CFString, 1, nil
-        ) else { return false }
+    static func pngData(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            data as CFMutableData, "public.png" as CFString, 1, nil
+        ) else { return nil }
         CGImageDestinationAddImage(dest, image, nil)
-        return CGImageDestinationFinalize(dest)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return data as Data
+    }
+
+    /// Makes sure the scratch folder exists (the system's tmp cleaner removes
+    /// one left unused for days, and a menu bar app outlives that) and
+    /// deletes frames old enough to be left over from a crash. Returns why
+    /// the folder is unusable, or nil.
+    @discardableResult
+    func prepareScratch() -> String? {
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: scratch, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+        } catch {
+            return "could not create \(scratch.path): \(error.localizedDescription)"
+        }
+        let cutoff = Date().addingTimeInterval(-staleFrameAge)
+        let names = (try? fm.contentsOfDirectory(atPath: scratch.path)) ?? []
+        for name in names where name.hasPrefix("frame-") && name.hasSuffix(".png") {
+            let url = scratch.appendingPathComponent(name)
+            let modified = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+            if (modified ?? .distantPast) < cutoff {
+                try? fm.removeItem(at: url)
+            }
+        }
+        return nil
+    }
+
+    enum FrameWrite { case success(URL), failure(String) }
+
+    /// Writes the frame to a new file only this user can read, refusing to
+    /// follow or reuse anything already at the path.
+    func writeFrame(_ png: Data) -> FrameWrite {
+        if let why = prepareScratch() { return .failure(why) }
+        let url = scratch.appendingPathComponent("frame-\(UUID().uuidString).png")
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            return .failure("could not write the screen frame: "
+                            + String(cString: strerror(errno)))
+        }
+        let ok = png.withUnsafeBytes { raw -> Bool in
+            var offset = 0
+            while offset < raw.count {
+                let n = Darwin.write(fd, raw.baseAddress! + offset, raw.count - offset)
+                if n > 0 { offset += n } else if n < 0 && errno == EINTR { continue } else {
+                    return false
+                }
+            }
+            return true
+        }
+        let err = errno
+        close(fd)
+        guard ok else {
+            try? FileManager.default.removeItem(at: url)
+            return .failure("could not write the screen frame: " + String(cString: strerror(err)))
+        }
+        return .success(url)
+    }
+
+    private func setFailure(_ why: String?) {
+        lock.lock(); lastFailureReason = why; lock.unlock()
+    }
+
+    private func fail(_ why: String) -> Result? {
+        setFailure(why)
+        return nil
     }
 
     private func failLaunch(_ why: String) {
@@ -413,22 +605,21 @@ public final class GroundingService {
     private func teardown(state newState: State) {
         lock.lock()
         let p = process
-        stderrHandle?.readabilityHandler = nil
+        let source = stderrSource
         process = nil
-        toChild = nil
-        stdoutHandle = nil
-        stderrHandle = nil
+        stderrSource = nil
         fromChildFD = -1
+        sidecarTakesInlineImage = false
         currentState = newState
         lock.unlock()
 
-        guard let p, p.isRunning else { return }
-        p.terminate()
-        // A process stuck inside a GPU call may ignore SIGTERM.
-        let pid = p.processIdentifier
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-            if p.isRunning { kill(pid, SIGKILL) }
-        }
+        source?.cancel()
+        guard let p else { return }
+        // SIGTERM, then SIGKILL after 2 s for a process stuck inside a GPU
+        // call, and reaped either way. The pipes close when the last
+        // reference to `p` goes.
+        p.closeStdin()
+        p.terminate(grace: 2)
     }
 
     private func stderrSuffix() -> String {

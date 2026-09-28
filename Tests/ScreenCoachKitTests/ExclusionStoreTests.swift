@@ -80,6 +80,16 @@ final class ExclusionStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), data, "the user's file was replaced")
     }
 
+    /// A CRLF file (Windows editor, or copied from another machine) must
+    /// load every rule. It used to parse as one line, and nothing matched.
+    func testACRLFFileLoadsEveryRule() throws {
+        try "# mine\r\nbundle: com.chase\r\ntitle: my bank\r\n"
+            .write(to: url, atomically: true, encoding: .utf8)
+        let store = ExclusionStore(url: url, queue: queue)
+        XCTAssertTrue(store.check(bundleID: "com.chase.app", windowTitle: nil).excluded)
+        XCTAssertTrue(store.check(bundleID: nil, windowTitle: "My Bank - login").excluded)
+    }
+
     func testAnUnreadableFileKeepsThePreviousRules() throws {
         try "bundle: com.keep.me\n".write(to: url, atomically: true, encoding: .utf8)
         let store = ExclusionStore(url: url, queue: queue)

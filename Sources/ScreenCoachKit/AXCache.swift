@@ -18,7 +18,11 @@ import ScreenCoachCore
 /// Three things drive a refresh:
 ///   * **Focus change** — a different app or window is in front.
 ///   * **AXObserver events** — the window moved, resized, its focus moved,
-///     a value, title or menu changed, an element appeared or went away.
+///     a title or menu changed; and, only while a lesson is watching for
+///     its step to finish, a value changed or an element appeared or went
+///     away. Event-driven walks are spaced (`minEventWalkIntervalMs`) and
+///     skipped while the user is idle, because some apps post these events
+///     by themselves several times a second.
 ///   * **Heartbeat** — nothing happened, but warmth decays anyway.
 ///
 /// And two things make a cached tree unservable even when it is young: the
@@ -38,6 +42,22 @@ public final class AXCache {
         public var ageMs: Double { Mono.msSince(capturedAtNs) }
     }
 
+    /// Content-change notifications (a value changed, an element appeared
+    /// or went away) are subscribed to only while something needs them: a
+    /// lesson watching for its step to finish. Apps whose content updates by
+    /// itself (a playing video's progress bar, a terminal, Activity Monitor,
+    /// Logic's LCD in playback) post them several times a second with nobody
+    /// at the keyboard, and each one used to cost a full tree walk.
+    ///
+    /// Event-driven walks are also spaced at least this far apart. Geometry,
+    /// focus, title and menu events still refresh the cache, just not more
+    /// often than this; a burst still ends in a walk (trailing edge), so the
+    /// final state is always read.
+    public var minEventWalkIntervalMs: Double = 1_000
+    /// The spacing while content changes are being watched, so a lesson step
+    /// completes within about a quarter of a second of the change.
+    public var watchedEventWalkIntervalMs: Double = 250
+
     /// Heartbeat interval. Chosen from the measured decay curve: trees are
     /// still near-warm at 5 s and clearly cooling by 10 s, so refreshing every
     /// 3 s keeps the fast path fast without hammering other apps.
@@ -49,10 +69,13 @@ public final class AXCache {
     /// press requires a human at the keyboard, and if nobody has produced an
     /// input event in over a minute, no press is imminent. Walking a heavy
     /// app's tree every three seconds through lunch is pure battery burn.
-    /// Event- and focus-driven refreshes are exempt: they only fire when
-    /// something is actually happening. The cost of the trade is one
-    /// cold-ish serve (~45–220 ms, once) if the user returns and summons
-    /// within the very first seconds.
+    ///
+    /// AX events are gated the same way. "An event means something is
+    /// happening" is not true of an app that updates itself, so an event
+    /// that arrives while the user is idle drops the cached tree instead of
+    /// walking; the next `tree()` reads on demand. Focus changes are exempt.
+    /// The cost of the trade is one cold-ish serve (~45–220 ms, once) if the
+    /// user returns and summons within the very first seconds.
     public var idleBackoffEnabled = true
     public var userIdleThreshold: TimeInterval = 60
 
@@ -87,20 +110,64 @@ public final class AXCache {
     /// help you inside your password manager, which is the correct trade.
     public var exclusionCheck: ((_ bundleID: String?, _ title: String?) -> String?)?
 
-    /// Set when the last refresh was refused, so the UI can explain itself
-    /// rather than looking broken.
+    /// Why the app the cache is following was refused, so the UI can explain
+    /// itself rather than looking broken. Nil when the current app was not
+    /// refused: a reason is kept together with the process it was about and
+    /// is never reported against a different app, and any read that gets
+    /// past the gate clears it, whether or not the walk then succeeds.
     public var lastExclusionReason: String? {
+        let pid = resolveTarget()?.processIdentifier
         lock.lock(); defer { lock.unlock() }
-        return exclusionReason
+        guard let refused = exclusion, refused.pid == pid else { return nil }
+        return refused.reason
+    }
+
+    /// Count of callers that need content-change events (see
+    /// `minEventWalkIntervalMs`). Use `beginWatchingContent()` and
+    /// `endWatchingContent()`, paired.
+    public var isWatchingContent: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return contentWatchers > 0
+    }
+
+    /// Subscribe to value, created and destroyed notifications for as long
+    /// as the caller needs them, and walk at the faster watched rate.
+    public func beginWatchingContent() {
+        lock.lock(); contentWatchers += 1; let first = contentWatchers == 1; lock.unlock()
+        if first { resubscribe() }
+    }
+
+    public func endWatchingContent() {
+        lock.lock()
+        let was = contentWatchers
+        contentWatchers = max(0, contentWatchers - 1)
+        let last = was == 1
+        lock.unlock()
+        if last { resubscribe() }
+    }
+
+    private func resubscribe() {
+        let work = { [weak self] in
+            guard let self else { return }
+            self.lock.lock(); let live = self.running; self.lock.unlock()
+            guard live else { return }
+            self.attachObserver()
+        }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 
     private let queue = DispatchQueue(label: "coach.axcache", qos: .userInitiated)
     private let queueKey = DispatchSpecificKey<Bool>()
     private let lock = NSLock()
     private var entry: Entry?
-    private var exclusionReason: String?
+    private var exclusion: (pid: pid_t, reason: String)?
     private var observer: AXObserver?
     private var observedPID: pid_t = 0
+    /// Whether the attached observer includes the content notifications.
+    private var observedContent = false
+    private var contentWatchers = 0
+    /// When the last walk started, for spacing event-driven walks.
+    private var lastWalkNs: UInt64 = 0
     private var timer: DispatchSourceTimer?
     private var running = false
     private var targetPID: pid_t = 0
@@ -287,6 +354,17 @@ public final class AXCache {
         }
     }
 
+    /// Ask for a fresh read without waiting for it. Debounced on its
+    /// trailing edge like an event refresh and run on the cache's own queue,
+    /// so repeated asks during a scroll coalesce into one walk per burst.
+    /// Skipped while the current app is in its failure backoff, and the
+    /// cached entry stays servable until the new one replaces it.
+    public func requestRefresh() {
+        guard running else { return }
+        if let pid = resolveTarget()?.processIdentifier, recentlyFailed(pid) { return }
+        refresh(reason: "requested")
+    }
+
     /// Drop the cached tree, so nothing from before this call is served
     /// again, and schedule a fresh read. For events that make every cached
     /// coordinate or gate decision suspect without any AX notification: a
@@ -295,6 +373,8 @@ public final class AXCache {
     public func invalidate() {
         lock.lock()
         entry = nil
+        // The rules may have changed; the next read decides afresh.
+        exclusion = nil
         failedPID = 0
         let live = running
         lock.unlock()
@@ -334,7 +414,13 @@ public final class AXCache {
     /// would cost more than the cache saves, but dropping the last event of a
     /// burst would leave the cache holding geometry from before a resize or
     /// drag ended.
-    private func refresh(reason: String, immediate: Bool = false) {
+    ///
+    /// Event-driven refreshes (`eventDriven`) are also throttled: never less
+    /// than `minEventWalkIntervalMs` (or the watched interval) after the
+    /// previous walk began. Rescheduling on each event of a continuous
+    /// stream keeps the same earliest time, so a stream of events yields one
+    /// walk per interval rather than none or one per event.
+    private func refresh(reason: String, immediate: Bool = false, eventDriven: Bool = false) {
         let now = Mono.nowNs()
         lock.lock()
         // Something happened in the app; a failed walk is worth retrying.
@@ -342,7 +428,13 @@ public final class AXCache {
         pendingRefresh?.cancel()
         if pendingRefresh == nil { burstStartNs = now }
         let waited = Mono.ms(from: burstStartNs, to: now)
-        let delayMs = (immediate || waited >= refreshMaxWaitMs) ? 0 : refreshDebounceMs
+        let minInterval = contentWatchers > 0 ? watchedEventWalkIntervalMs
+                                              : minEventWalkIntervalMs
+        let delayMs = Self.eventWalkDelayMs(
+            immediate: immediate, eventDriven: eventDriven,
+            msSinceBurstStart: waited, msSinceLastWalk: Mono.ms(from: lastWalkNs, to: now),
+            debounceMs: refreshDebounceMs, maxWaitMs: refreshMaxWaitMs,
+            minIntervalMs: lastWalkNs == 0 ? 0 : minInterval)
         refreshSeq += 1
         let mySeq = refreshSeq
         let work = DispatchWorkItem { [weak self] in
@@ -351,11 +443,49 @@ public final class AXCache {
             if self.refreshSeq == mySeq { self.pendingRefresh = nil }
             self.lock.unlock()
             guard self.running else { return }
+            if eventDriven, self.idleBackoffEnabled,
+               Self.secondsSinceUserInput() > self.userIdleThreshold {
+                // Nobody is at the keyboard: the app changed by itself.
+                // Drop the stale tree rather than walk it; the next query
+                // re-reads on demand.
+                self.lock.lock(); self.entry = nil; self.lock.unlock()
+                return
+            }
             _ = self.extractNow(reason: reason)
         }
         pendingRefresh = work
         lock.unlock()
         queue.asyncAfter(deadline: .now() + delayMs / 1000, execute: work)
+    }
+
+    /// How long to wait before a scheduled walk. Pure, for tests.
+    ///
+    /// Immediate requests (focus changes, start, invalidation) run now.
+    /// Otherwise a burst is debounced on its trailing edge, but never for
+    /// longer than `maxWaitMs` from the burst's first event; and an
+    /// event-driven walk also waits until `minIntervalMs` after the last one.
+    static func eventWalkDelayMs(immediate: Bool, eventDriven: Bool,
+                                 msSinceBurstStart: Double, msSinceLastWalk: Double,
+                                 debounceMs: Double, maxWaitMs: Double,
+                                 minIntervalMs: Double) -> Double {
+        if immediate { return 0 }
+        let debounce = msSinceBurstStart >= maxWaitMs ? 0 : debounceMs
+        guard eventDriven else { return debounce }
+        return max(debounce, minIntervalMs - msSinceLastWalk, 0)
+    }
+
+    /// Which titles the title rules are checked against before a walk.
+    ///
+    /// The rule is that exclusion is decided without reading the app. The
+    /// window server's title needs no AX call, so whenever it is available
+    /// (Screen Recording granted) it is the only source. Without Screen
+    /// Recording the window server withholds titles, and failing open would
+    /// make every title rule inert for a user who has granted Accessibility
+    /// only, so then, and only then, the focused window's AXTitle is read:
+    /// one attribute of an app whose bundle is already allowed.
+    static func preWalkTitleSources(canReadWindowServerTitles: Bool) -> (windowServer: Bool,
+                                                                        axTitle: Bool) {
+        (windowServer: true, axTitle: !canReadWindowServerTitles)
     }
 
     /// Runs on `queue` only.
@@ -371,15 +501,16 @@ public final class AXCache {
                 refuse(pid: pid, reason: why)
                 return nil
             }
-            // 2. The window title, before the walk. The window server's title
-            //    needs no AX call but is withheld without Screen Recording
-            //    permission, so the focused window's AXTitle — one attribute
-            //    of an app whose bundle is allowed — is checked as well.
-            //    Failing open on a nil title would make every title rule
-            //    inert for a user who has only granted Accessibility.
-            let titles = [WindowServer.frontWindowTitle(pid: pid),
-                          AXExtractor.focusedWindowTitle(pid: pid,
-                                                         messagingTimeout: limits.messagingTimeout)]
+            // 2. The window title, before the walk: see
+            //    `preWalkTitleSources` for why AXTitle is read only when the
+            //    window server will not say.
+            let sources = Self.preWalkTitleSources(
+                canReadWindowServerTitles: WindowServer.canReadWindowTitles)
+            var titles: [String?] = [WindowServer.frontWindowTitle(pid: pid)]
+            if sources.axTitle {
+                titles.append(AXExtractor.focusedWindowTitle(
+                    pid: pid, messagingTimeout: limits.messagingTimeout))
+            }
             for title in titles.compactMap({ $0 }) {
                 if let why = check(bundleID, title) {
                     refuse(pid: pid, reason: why)
@@ -389,6 +520,11 @@ public final class AXCache {
         }
 
         lock.lock()
+        // Past the gate: whatever happens to the walk, this app was not
+        // refused, and an older reason (about this or any other app) must
+        // not be shown as if it were.
+        exclusion = nil
+        lastWalkNs = Mono.nowNs()
         let force = !forcedPIDs.contains(pid)
         forcedPIDs.insert(pid)
         lock.unlock()
@@ -422,7 +558,7 @@ public final class AXCache {
 
         lock.lock()
         entry = Entry(snapshot: snapshot, capturedAtNs: Mono.nowNs())
-        exclusionReason = nil
+        exclusion = nil
         failedPID = 0
         refreshCount += 1
         let observing = observedPID == pid
@@ -439,7 +575,7 @@ public final class AXCache {
     private func refuse(pid: pid_t, reason: String) {
         lock.lock()
         entry = nil
-        exclusionReason = reason
+        exclusion = (pid, reason)
         let observing = observedPID == pid
         lock.unlock()
         if observing {
@@ -481,7 +617,10 @@ public final class AXCache {
             detachObserver()
             return
         }
-        lock.lock(); let already = observedPID == pid; lock.unlock()
+        lock.lock()
+        let wantContent = contentWatchers > 0
+        let already = observedPID == pid && observedContent == wantContent
+        lock.unlock()
         guard !already else { return }
         detachObserver()
 
@@ -492,24 +631,14 @@ public final class AXCache {
         let callback: AXObserverCallback = { _, _, _, refcon in
             guard let refcon else { return }
             let me = Unmanaged<AXCache>.fromOpaque(refcon).takeUnretainedValue()
-            me.refresh(reason: "ax event")
+            me.refresh(reason: "ax event", eventDriven: true)
         }
         guard AXObserverCreate(pid, callback, &obs) == .success, let created = obs else {
             return
         }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         var subscribed = false
-        // Geometry and focus, plus the content changes that complete a lesson
-        // step or follow a recorded click: a value, a title or a menu
-        // changed, an element appeared or went away. A title change also
-        // matters for privacy: a tab that switches to an excluded title is
-        // re-checked straight away rather than at the next heartbeat.
-        for note in [kAXWindowMovedNotification, kAXWindowResizedNotification,
-                     kAXFocusedWindowChangedNotification, kAXWindowCreatedNotification,
-                     kAXFocusedUIElementChangedNotification, kAXValueChangedNotification,
-                     kAXTitleChangedNotification, kAXMenuOpenedNotification,
-                     kAXMenuClosedNotification, kAXCreatedNotification,
-                     kAXUIElementDestroyedNotification] {
+        for note in Self.notifications(watchingContent: wantContent) {
             if AXObserverAddNotification(created, appElement, note as CFString, refcon) == .success {
                 subscribed = true
             }
@@ -520,7 +649,29 @@ public final class AXCache {
         lock.lock()
         observer = created
         observedPID = pid
+        observedContent = wantContent
         lock.unlock()
+    }
+
+    /// Geometry, focus, titles and menus always. A title change matters for
+    /// privacy: a tab that switches to an excluded title is re-checked
+    /// straight away rather than at the next heartbeat. Menus open and close
+    /// only when someone uses them, so they cost nothing at rest.
+    ///
+    /// Values, elements created and elements destroyed only while content is
+    /// being watched (a lesson step waiting to complete): these are the ones
+    /// an app posts by itself, several times a second, while it plays or
+    /// streams output.
+    static func notifications(watchingContent: Bool) -> [String] {
+        var out = [kAXWindowMovedNotification, kAXWindowResizedNotification,
+                   kAXFocusedWindowChangedNotification, kAXWindowCreatedNotification,
+                   kAXFocusedUIElementChangedNotification, kAXTitleChangedNotification,
+                   kAXMenuOpenedNotification, kAXMenuClosedNotification]
+        if watchingContent {
+            out += [kAXValueChangedNotification, kAXCreatedNotification,
+                    kAXUIElementDestroyedNotification]
+        }
+        return out
     }
 
     /// Main thread only.
@@ -529,6 +680,7 @@ public final class AXCache {
         let obs = observer
         observer = nil
         observedPID = 0
+        observedContent = false
         lock.unlock()
         if let obs {
             CFRunLoopRemoveSource(CFRunLoopGetMain(),
@@ -537,8 +689,8 @@ public final class AXCache {
     }
 
     public var statusLine: String {
+        if let why = lastExclusionReason { return "excluded: \(why)" }
         lock.lock(); defer { lock.unlock() }
-        if let why = exclusionReason { return "excluded: \(why)" }
         guard let e = entry else { return "no tree cached" }
         return String(format: "%@: %d nodes, %.0f ms old, %d refreshes, %d warm / %d cold",
                       e.snapshot.appName, e.snapshot.nodeCount, e.ageMs,
