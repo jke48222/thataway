@@ -148,9 +148,61 @@ class SidecarLeavesNothingOnDisk(unittest.TestCase):
         self.assertGreaterEqual(out[1]["y"], 50)
         self.assertLessEqual(out[1]["y"], 150)
 
+    def test_ready_line_offers_inline_frames(self):
+        out = self.run_server(FakeMLX(), [])
+        self.assertTrue(out[0]["ready"])
+        self.assertIs(out[0]["inline_image"], True)
+
+    def test_an_inline_frame_is_read_from_the_request_and_no_file_is_touched(self):
+        import base64
+        png = base64.b64encode(self.frame.read_bytes()).decode("ascii")
+        self.frame.unlink()
+        fake = FakeMLX(accepts_pil=True)
+        out = self.run_server(fake, [{"id": 7, "image_png_b64": png,
+                                      "query": "the Play button"}])
+        self.assertEqual(out[1]["id"], 7)
+        self.assertIn("x", out[1])
+        self.assertTrue(all(isinstance(i, Image.Image) for i in fake.seen))
+        self.assert_no_frames_left()
+
+    def test_frames_a_killed_run_left_are_swept_and_fresh_ones_kept(self):
+        import time
+        stale = self.tmp / "holo-stale.png"
+        fresh = self.tmp / "holo-fresh.png"
+        other = self.tmp / "unrelated.png"
+        for p in (stale, fresh, other):
+            p.write_bytes(b"frame")
+        old = time.time() - 3600
+        os.utime(stale, (old, old))
+        os.utime(other, (old, old))
+        self.run_server(FakeMLX(), [])
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue(other.exists())
+
     def test_importing_the_sidecar_writes_no_bytecode(self):
         import holo_server  # noqa: F401
         self.assertTrue(sys.dont_write_bytecode)
+
+
+class ParseClickTakesOnlyAJSONAnswer(unittest.TestCase):
+
+    def setUp(self):
+        from holo_bench import parse_click
+        self.parse = parse_click
+
+    def test_a_json_answer_inside_prose_is_read(self):
+        self.assertEqual(self.parse('Sure: {"x": 12, "y": 34.5} done'), (12.0, 34.5))
+
+    def test_numbers_in_prose_are_not_an_answer(self):
+        self.assertIsNone(self.parse("The button at 640, 480 is labelled Play"))
+
+    def test_non_numeric_coordinates_are_rejected(self):
+        self.assertIsNone(self.parse('{"x": "640", "y": 480}'))
+        self.assertIsNone(self.parse('{"x": true, "y": 480}'))
+
+    def test_a_later_object_is_found_after_an_unusable_one(self):
+        self.assertEqual(self.parse('{"note": 1} then {"x": 5, "y": 6}'), (5.0, 6.0))
 
 
 if __name__ == "__main__":

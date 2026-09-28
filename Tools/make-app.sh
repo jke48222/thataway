@@ -53,7 +53,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>NSMicrophoneUsageDescription</key>
   <string>The coach listens only while you hold the shortcut, so you can name what you are looking for out loud. Recognition runs on this Mac; no audio leaves it.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
-  <string>Turns what you say while holding the shortcut into a target to point at. On-device recognition is required — the coach refuses rather than sending audio to a server.</string>
+  <string>Turns what you say while holding the shortcut into a target to point at. On-device recognition is required: the coach refuses rather than sending audio to a server.</string>
 </dict>
 </plist>
 PLIST
@@ -73,7 +73,7 @@ if [ -n "$IDENTITY" ]; then
   echo "Signed: $IDENTITY (hardened runtime, ready for notarytool)"
 elif [ -n "$APPLEDEV" ]; then
   codesign --force --entitlements "$ENTITLEMENTS" --sign "$APPLEDEV" "$APP"
-  echo "Signed: $APPLEDEV (stable — TCC grants survive rebuilds)"
+  echo "Signed: $APPLEDEV (stable, so TCC grants survive rebuilds)"
 else
   codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP"
   echo "Ad-hoc signed. WARNING: Accessibility will be revoked on every rebuild."

@@ -15,20 +15,28 @@ bug.
 
 Protocol — one JSON object per line each way:
 
-    <- {"id":1,"image":"/tmp/f.png","query":"the Play button","crop":[x,y,w,h]}
+    <- {"id":1,"image_png_b64":"iVBOR...","query":"the Play button","crop":[x,y,w,h]}
+    <- {"id":1,"image":"/tmp/f.png","query":"the Play button"}   older callers
     -> {"id":1,"x":1131.0,"y":287.0,"ttft_ms":1610,"total_ms":1901,"tokens":980}
 
-    -> {"ready":true,"model":"...","load_s":0.5}      once, at startup
-    -> {"id":1,"error":"..."}                          on failure
+    -> {"ready":true,"inline_image":true,"model":"...","load_s":0.5}   once, at startup
+    -> {"id":1,"error":"..."}                                            on failure
 
-Nothing the sidecar sees is written to disk. The caller's frame is read once
+`inline_image` in the ready line tells the app it may send the frame as base64
+PNG in `image_png_b64`, so the frame never exists as a file. A request with
+only `image` (a path) is still read, for callers that predate that.
+
+Nothing the sidecar sees is written to disk. The caller's frame is decoded once
 and the crop/resize is handed to mlx_vlm as an in-memory PIL image. If an older
 mlx_vlm only accepts paths, the image goes to a per-request temp file in the
 private $TMPDIR, which is unlinked as soon as generation ends, including on
-error and on SIGTERM.
+error and on SIGTERM. SIGKILL skips that `finally`, so each start also removes
+holo-*.png files an earlier, killed run left behind.
 """
 
+import base64
 import contextlib
+import io
 import json
 import math
 import os
@@ -57,6 +65,22 @@ except Exception as e:  # noqa: BLE001
 # Earlier builds kept the last frame here for the sidecar's whole lifetime.
 # It is removed at startup so an upgrade also cleans up what they left behind.
 LEGACY_SCRATCH_NAME = ".holo_server_input.png"
+
+# A temp frame lives for one generation, a few seconds. One older than this was
+# left by a run that was SIGKILLed mid-query; a younger one may belong to a
+# second sidecar (the bench beside the app) and is left alone.
+STALE_FRAME_SECONDS = 300
+
+
+def sweep_stale_frames(directory=None, now=None):
+    """Delete holo-*.png temp frames a killed run left in `directory`."""
+    directory = Path(directory or tempfile.gettempdir())
+    now = time.time() if now is None else now
+    for path in directory.glob("holo-*.png"):
+        with contextlib.suppress(OSError):
+            st = path.lstat()
+            if st.st_uid == os.getuid() and now - st.st_mtime > STALE_FRAME_SECONDS:
+                path.unlink()
 
 
 def emit(obj):
@@ -123,9 +147,10 @@ def main():
     signal.signal(signal.SIGTERM, _exit_on_sigterm)
     with contextlib.suppress(OSError):
         (Path(model_path).parent / LEGACY_SCRATCH_NAME).unlink(missing_ok=True)
+    sweep_stale_frames()
     in_memory = accepts_pil_images()
 
-    emit({"ready": True, "model": model_path,
+    emit({"ready": True, "inline_image": True, "model": model_path,
           "load_s": round(time.perf_counter() - t0, 2)})
 
     for line in sys.stdin:
@@ -141,7 +166,11 @@ def main():
 
         rid = req.get("id")
         try:
-            with Image.open(req["image"]) as src:
+            if "image_png_b64" in req:
+                source = io.BytesIO(base64.b64decode(req["image_png_b64"], validate=True))
+            else:
+                source = req["image"]
+            with Image.open(source) as src:
                 image = src.convert("RGB")
 
             # Crop first, resize second. Doing it the other way round throws
