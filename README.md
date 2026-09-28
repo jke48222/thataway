@@ -68,8 +68,7 @@ Option Space  ->  CommandBar  ->  AXResolver  ->  score >= 0.62 ?
 [`AXCache.swift`](Sources/ThatawayKit/AXCache.swift) extracts the frontmost app's tree when
 focus changes, refreshes it when an `AXObserver` says something moved, and runs a low-rate
 heartbeat to keep it warm. By the time you press Option Space the answer is already in memory.
-This is not an optimization that was added later. It is load bearing, and the measurement that
-made it load bearing is in Results below.
+The cache is load bearing, and the measurement that made it so is in Results below.
 
 **The resolver is lexical, not learned.**
 [`AXResolver.swift`](Sources/ThatawayCore/AXResolver.swift) scores your query against the
@@ -87,7 +86,7 @@ usually knows roughly where that kind of thing lives, so `cropHint` aims a crop.
 fewer image tokens means less latency, and image tokens are what this model's latency is made of.
 
 **Fusion is the part that is actually novel.**
-[`Fusion.swift`](Sources/ThatawayCore/Fusion.swift) has to combine two very different things.
+[`Fusion.swift`](Sources/ThatawayCore/Fusion.swift) has to combine two different kinds of answer.
 An accessibility candidate has exact bounds, a score and semantics. A vision candidate has a point,
 no bounds, no semantics, and usually no confidence at all, because the model emits a click without
 a probability. The rule it settles on: **agreement between two independent methods is the only
@@ -121,9 +120,9 @@ the bookmarks bar**, which is to say seven instances of the same kind of control
 [`PHASE-0-FINDINGS.md`](PHASE-0-FINDINGS.md) says so itself, and the comparison it draws is the
 important one: Chrome's toolbar is "a far easier target than Logic's dense professional UI," and
 the full-frame vision baseline scores **83 percent on Chrome against 40 percent on Logic Pro**.
-The accessibility tree is more robust than vision across that gap, but nobody should read
-12 of 12 on a browser toolbar as a general result. The honest phrasing is the one in the table:
-twelve of twelve on a Chrome window.
+The accessibility tree reads labels rather than pixels, so dense layouts cost it less than they
+cost vision, but nobody should read 12 of 12 on a browser toolbar as a general result. The
+phrasing that holds is the one in the table: twelve of twelve on a Chrome window.
 
 ### The 0.07 ms in `live-eval.json` is not a measurement
 
