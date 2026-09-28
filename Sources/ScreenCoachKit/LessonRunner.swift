@@ -13,11 +13,26 @@ import ScreenCoachCore
 /// is the detail that makes it work. A change spread over several observer
 /// events never looks like a change between consecutive polls — each one is
 /// identical to the last — so a step that took a moment would never complete.
+///
+/// Both trees must come from the app the lesson is being taught in. The
+/// cache follows focus, so after the learner clicks over to another app its
+/// tree is that app's; comparing app A's starting tree with app B's current
+/// one would complete `elementAppears` on any label B happens to have and
+/// `valueChanges` on any field whose value differs. So the runner remembers
+/// the lesson's process and ignores every other app's tree until the
+/// learner comes back.
 public final class LessonRunner {
 
     public private(set) var progress: LessonProgress?
     private let cache: AXCache
     private var stepStartTree: [AXNode] = []
+    /// The process the lesson is being taught in: the app in front when it
+    /// started, or the first app seen after that if nothing was readable
+    /// then. Nil when no lesson is running.
+    public private(set) var lessonPID: pid_t?
+    /// That app's name, for "switch back to …".
+    public private(set) var lessonAppName: String?
+    private var watchingContent = false
     private var timer: DispatchSourceTimer?
     private var stepStartedAtNs: UInt64 = 0
 
@@ -56,9 +71,31 @@ public final class LessonRunner {
 
     public var isRunning: Bool { progress != nil && !(progress?.isFinished ?? true) }
 
+    /// Whether a step may be judged on a tree read from `currentPID`. Pure.
+    ///
+    /// Only the lesson's own app counts. With no lesson app yet (nothing was
+    /// readable when the lesson began) the first app seen becomes it.
+    public static func shouldEvaluate(lessonPID: pid_t?, currentPID: pid_t) -> Bool {
+        lessonPID == nil || lessonPID == currentPID
+    }
+
+    /// Whether `snapshot` is from the app the lesson is about, so the app
+    /// can draw the step on it. False while the learner is in another app,
+    /// when the step should say "switch back to `lessonAppName`" instead of
+    /// ranking the target against a foreign app's controls.
+    public func isLessonApp(_ snapshot: AXTreeSnapshot) -> Bool {
+        guard isRunning else { return false }
+        return Self.shouldEvaluate(lessonPID: lessonPID, currentPID: snapshot.pid)
+    }
+
     public func start(_ lesson: Lesson) {
         let p = LessonProgress(lesson: lesson)
         progress = p
+        lessonPID = nil
+        lessonAppName = nil
+        // A step completes on a value changing or an element appearing,
+        // which the cache only hears about while someone is watching.
+        startWatchingContent()
         beginCurrentStep()
         onStep?(p, p.current)
         reportManualStall()
@@ -70,8 +107,25 @@ public final class LessonRunner {
         timer = nil
         progress = nil
         stepStartTree = []
+        lessonPID = nil
+        lessonAppName = nil
         isStalled = false
+        stopWatchingContent()
     }
+
+    private func startWatchingContent() {
+        guard !watchingContent else { return }
+        watchingContent = true
+        cache.beginWatchingContent()
+    }
+
+    private func stopWatchingContent() {
+        guard watchingContent else { return }
+        watchingContent = false
+        cache.endWatchingContent()
+    }
+
+    deinit { stopWatchingContent() }
 
     /// Manual advance — for `.manual` steps, and for when the learner knows
     /// better than the tree does.
@@ -82,6 +136,7 @@ public final class LessonRunner {
         if p.isFinished {
             timer?.cancel()
             timer = nil
+            stopWatchingContent()
             onStep?(p, nil)
             return
         }
@@ -95,6 +150,7 @@ public final class LessonRunner {
         guard var p = progress else { return }
         p.back()
         progress = p
+        if isRunning { startWatchingContent() }
         beginCurrentStep()
         onStep?(p, p.current)
         reportManualStall()
@@ -104,9 +160,23 @@ public final class LessonRunner {
     // MARK: - Watching
 
     private func beginCurrentStep() {
-        stepStartTree = cache.tree()?.nodes ?? []
+        // The baseline is taken from the lesson's app only. If another app
+        // is in front (the learner pressed Next Step from there), start from
+        // nothing and take the baseline when they come back.
+        stepStartTree = []
+        if let tree = cache.tree(), !tree.nodes.isEmpty,
+           Self.shouldEvaluate(lessonPID: lessonPID, currentPID: tree.pid) {
+            adopt(tree)
+            stepStartTree = tree.nodes
+        }
         stepStartedAtNs = Mono.nowNs()
         isStalled = false
+    }
+
+    private func adopt(_ tree: AXTreeSnapshot) {
+        guard lessonPID == nil else { return }
+        lessonPID = tree.pid
+        lessonAppName = tree.appName
     }
 
     private func reportManualStall() {
@@ -143,12 +213,18 @@ public final class LessonRunner {
         // runner paying for a walk — and an app with no window no longer
         // costs a failed 250 ms walk on every tick.
         guard let tree = cache.cachedEntry?.snapshot, !tree.nodes.isEmpty else { return }
+        // Another app's tree says nothing about this step. Wait, without
+        // judging or re-baselining, until the learner is back.
+        guard Self.shouldEvaluate(lessonPID: lessonPID, currentPID: tree.pid) else { return }
+        adopt(tree)
         let now = tree.nodes
         let step = rawStep.resolved(appName: tree.appName)
 
         // A step whose starting tree was empty has nothing to compare against
-        // — usually the app was mid-transition. Re-baseline instead of
-        // comparing to nothing and completing spuriously.
+        // — usually the app was mid-transition, or the step began while the
+        // learner was in another app. Re-baseline (on the lesson's app, per
+        // the check above) instead of comparing to nothing and completing
+        // spuriously.
         if stepStartTree.isEmpty {
             stepStartTree = now
             return

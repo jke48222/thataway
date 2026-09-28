@@ -23,6 +23,12 @@ public final class OverlayPanel: NSPanel {
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         animationBehavior = .none
+        // Kept out of screen capture as well as cut from the vision frame by
+        // process ID in `ScreenGrab`. The ring and caption are drawn at the
+        // tree's guess before vision runs, and a model that could see them
+        // would "corroborate" that guess. Two mechanisms, so a panel ordered
+        // in after the shareable content was listed is still not captured.
+        sharingType = .none
         contentView = {
             let v = NSView(frame: CGRect(origin: .zero, size: screenFrame.size))
             v.wantsLayer = true
@@ -68,13 +74,13 @@ public final class PointerLayer {
     private let badgeText = CATextLayer()
 
     /// ≈3.3:1 against white, above the 3:1 WCAG 1.4.11 asks of graphics.
-    private static let accent = NSColor(srgbRed: 0.20, green: 0.55, blue: 1.0, alpha: 1)
+    static let accent = NSColor(srgbRed: 0.20, green: 0.55, blue: 1.0, alpha: 1)
     /// The uncertain state. The old pale amber (1.0, 0.70, 0.10) was about
     /// 1.8:1 on white, so the ring was hardest to see exactly when the user
     /// most needed to see what was being suggested. This is ≈3.5:1.
-    private static let warn = NSColor(srgbRed: 0.80, green: 0.45, blue: 0.0, alpha: 1)
+    static let warn = NSColor(srgbRed: 0.80, green: 0.45, blue: 0.0, alpha: 1)
     /// Badge fill dark enough for 15 pt white text (≈5.4:1; 4.5:1 required).
-    private static let badgeFill = NSColor(srgbRed: 0.0, green: 0.40, blue: 0.85, alpha: 1)
+    static let badgeFill = NSColor(srgbRed: 0.0, green: 0.40, blue: 0.85, alpha: 1)
 
     /// Whether to fly and pulse. When the user has Reduce Motion on, the
     /// pointer appears at the target and the ring fades in; nothing sweeps
@@ -119,7 +125,11 @@ public final class PointerLayer {
         label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         label.foregroundColor = NSColor.white.cgColor
         label.alignmentMode = .center
-        label.truncationMode = .end
+        // Wrapped to at most `captionMaxLines`; `captionLayout` shortens the
+        // text itself when even that is not enough, so the layer never has
+        // to truncate (and never cuts the "?" or the note off the end).
+        label.isWrapped = true
+        label.truncationMode = .none
         label.contentsScale = scale
         label.actions = noImplicitAnimations
 
@@ -195,16 +205,33 @@ public final class PointerLayer {
             badgeText.isHidden = true
             return
         }
-        // Badge sits at the target's top-left, nudged outside so it never
-        // covers the thing it is pointing at.
         let d: CGFloat = 30
-        let origin = CGPoint(x: cutout.minX - d - 6, y: cutout.maxY - d / 2)
-        let box = CGRect(x: origin.x, y: origin.y, width: d, height: d)
+        let box = Self.badgeRect(for: cutout, in: root.bounds, diameter: d)
         badge.path = CGPath(ellipseIn: box, transform: nil)
         badge.isHidden = false
         badgeText.string = "\(stepNumber)"
         badgeText.frame = CGRect(x: box.minX, y: box.minY + 5, width: d, height: d - 8)
         badgeText.isHidden = false
+    }
+
+    /// Where the numbered step badge goes. Pure, in panel-local space.
+    ///
+    /// By default at the target's top-left, nudged outside so it never
+    /// covers the thing it is pointing at. A menu-bar target's box reaches
+    /// the top of the screen and a sidebar item's the left edge, so there the
+    /// default would put the badge (and the step number) off the panel:
+    /// it flips below the target when it would cross the top, to the right
+    /// when it would cross the left, and is kept on screen either way.
+    static func badgeRect(for cutout: CGRect, in bounds: CGRect,
+                          diameter d: CGFloat) -> CGRect {
+        let margin: CGFloat = 6
+        var x = cutout.minX - d - margin
+        var y = cutout.maxY - d / 2
+        if y + d > bounds.maxY - margin { y = cutout.minY - d - margin }
+        if x < bounds.minX + margin { x = cutout.maxX + margin }
+        x = min(max(x, bounds.minX + margin), bounds.maxX - d - margin)
+        y = min(max(y, bounds.minY + margin), bounds.maxY - d - margin)
+        return CGRect(x: x, y: y, width: d, height: d)
     }
 
     /// Fly to `target` and mark it. Coordinates are in the panel's own
@@ -314,6 +341,13 @@ public final class PointerLayer {
         return true
     }
 
+    /// Where the pointer's tip is drawn right now, mid-flight included, in
+    /// panel-local space. Nil while nothing is showing.
+    public var tipPosition: CGPoint? {
+        guard !root.isHidden, lastBox != nil else { return nil }
+        return cursor.presentation()?.position ?? cursor.position
+    }
+
     /// Put the pointer on `target` at once: no flight and no echo. For a
     /// lesson step whose control moved (a window being dragged), where a
     /// fresh flight from the mouse on every frame would be noise.
@@ -382,20 +416,122 @@ public final class PointerLayer {
     }
 
     private func layoutLabel(_ text: String, near rect: CGRect, tint: NSColor) {
-        label.string = text
-        let font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        let width = min(360, (text as NSString)
-            .size(withAttributes: [.font: font]).width + 22)
-        let height: CGFloat = 24
-        // Prefer above the target; flip below when there is no room, so the
-        // caption never runs off the top of the screen.
-        var y = rect.maxY + 10
-        if y + height > root.bounds.maxY - 6 { y = rect.minY - height - 10 }
-        let x = min(max(rect.midX - width / 2, 6), root.bounds.maxX - width - 6)
-        labelBG.frame = CGRect(x: x, y: y, width: width, height: height)
+        let layout = Self.captionLayout(text, near: rect, in: root.bounds)
+        label.string = layout.text
+        labelBG.frame = layout.background
         labelBG.borderColor = tint.withAlphaComponent(0.5).cgColor
         labelBG.borderWidth = 1
-        label.frame = CGRect(x: x, y: y + 4, width: width, height: height - 7)
+        label.frame = layout.textFrame
+    }
+
+    static let captionFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+    static let captionMaxWidth: CGFloat = 360
+    static let captionInset: CGFloat = 11
+    static let captionMaxLines = 3
+
+    struct CaptionLayout: Equatable {
+        /// What is drawn: newlines flattened and, only if it would not fit
+        /// in `captionMaxLines`, the label shortened in the middle.
+        let text: String
+        let background: CGRect
+        let textFrame: CGRect
+    }
+
+    /// Size and place the caption pill. Pure, in panel-local space.
+    ///
+    /// The caption is the target's label, then possibly "?" and a note after
+    /// "  ·  " (why vision was skipped, say). One 360 pt line cut lesson
+    /// instructions and dropped the note first, so the text wraps to up to
+    /// three lines inside 11 pt of padding; if it still does not fit, the
+    /// label part is shortened in the middle and the "?" and note are kept.
+    ///
+    /// Placed above the ring, below it when the top has no room, inside the
+    /// ring's top edge when neither does (a target nearly as tall as the
+    /// display), and never off the panel.
+    static func captionLayout(_ raw: String, near ring: CGRect,
+                              in bounds: CGRect) -> CaptionLayout {
+        let text = fitCaption(flatten(raw))
+        let inner = captionMaxWidth - 2 * captionInset
+        let measured = measure(text, width: inner)
+        // Two points of slack: Core Text in the layer can need a hair more
+        // than AppKit measured, and must not wrap a line that fits here.
+        let textW = min(inner, ceil(measured.width) + 2)
+        let textH = ceil(measured.height)
+        let width = min(textW + 2 * captionInset, bounds.width - 12)
+        let height = max(24, textH + 8)
+        let margin: CGFloat = 6
+
+        var y = ring.maxY + 10
+        if y + height > bounds.maxY - margin {
+            y = ring.minY - height - 10
+            if y < bounds.minY + margin {
+                // Neither side has room: sit just inside the ring's top.
+                y = ring.maxY - height - margin
+            }
+        }
+        y = min(max(y, bounds.minY + margin), bounds.maxY - height - margin)
+        let x = min(max(ring.midX - width / 2, bounds.minX + margin),
+                    bounds.maxX - width - margin)
+        let background = CGRect(x: x, y: y, width: width, height: height)
+        let textFrame = CGRect(x: x + captionInset, y: y + (height - textH) / 2,
+                               width: width - 2 * captionInset, height: textH)
+        return CaptionLayout(text: text, background: background, textFrame: textFrame)
+    }
+
+    /// Titles can carry internal newlines (the tree trims only the ends),
+    /// and a newline would draw a line the pill was not sized for.
+    static func flatten(_ s: String) -> String {
+        s.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private static func measure(_ text: String, width: CGFloat) -> CGSize {
+        (text as NSString).boundingRect(
+            with: CGSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin],
+            attributes: [.font: captionFont]).size
+    }
+
+    private static var captionMaxTextHeight: CGFloat {
+        ceil(measure("Ag", width: .greatestFiniteMagnitude).height) * CGFloat(captionMaxLines)
+            + 1
+    }
+
+    /// The caption as drawn: unchanged when it fits in `captionMaxLines`,
+    /// otherwise the part before "?" or "  ·  " shortened in the middle.
+    static func fitCaption(_ text: String) -> String {
+        let inner = captionMaxWidth - 2 * captionInset
+        let limit = captionMaxTextHeight
+        guard measure(text, width: inner).height > limit else { return text }
+
+        // Split into the label and the tail that must survive.
+        var head = text
+        var tail = ""
+        if let dot = text.range(of: "  ·  ") {
+            head = String(text[..<dot.lowerBound])
+            tail = String(text[dot.lowerBound...])
+        }
+        if head.hasSuffix("?") {
+            head.removeLast()
+            tail = "?" + tail
+        }
+        var chars = Array(head)
+        while chars.count > 1 {
+            chars.remove(at: chars.count / 2)
+            let half = chars.count / 2
+            let candidate = String(chars[..<half]) + "…" + String(chars[half...]) + tail
+            if measure(candidate, width: inner).height <= limit { return candidate }
+        }
+        // Even the note alone is too long: shorten the whole thing.
+        var all = Array(text)
+        while all.count > 1 {
+            all.removeLast()
+            let candidate = String(all) + "…"
+            if measure(candidate, width: inner).height <= limit { return candidate }
+        }
+        return text
     }
 
     public func hide() {
@@ -519,6 +655,39 @@ public final class OverlayController {
         let work = DispatchWorkItem { [weak self] in self?.hide() }
         hideWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAfter, execute: work)
+    }
+
+    /// Move the pointer already on screen to a different control, flying
+    /// from where its tip is now rather than from the mouse. A vision
+    /// refinement that changes the target should read as the pointer
+    /// correcting itself, not as a second answer arriving.
+    ///
+    /// Returns false, and changes nothing, when no pointer is showing or it
+    /// is on a different display from `bounds`; the caller then uses
+    /// `point(at:)`.
+    @discardableResult
+    public func retarget(to bounds: ScreenRect, caption: String,
+                         confidence: PointerLayer.Confidence,
+                         dismissAfter: TimeInterval) -> Bool {
+        guard let index = shownIndex, index == bounds.screenIndex,
+              let pointer = pointers[index],
+              let screen = NSScreen.screens[safe: index],
+              let start = pointer.tipPosition else { return false }
+
+        let ak = space.appKitRect(fromCG: bounds.cg)
+        let local = CGRect(x: ak.minX - screen.frame.minX,
+                           y: ak.minY - screen.frame.minY,
+                           width: ak.width, height: ak.height)
+
+        pointer.setScrim(cutout: nil, stepNumber: nil)
+        pointer.point(from: start, to: CGPoint(x: local.midX, y: local.midY),
+                      box: local, caption: caption, confidence: confidence)
+
+        hideWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.hide() }
+        hideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + dismissAfter, execute: work)
+        return true
     }
 
     /// Teaching mode: point, dim everything else, and number the step.

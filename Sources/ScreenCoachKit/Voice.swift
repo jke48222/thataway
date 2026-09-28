@@ -50,7 +50,19 @@ public final class Voice: NSObject {
 
     /// Longest the microphone may stay open for one hold. A key-up that never
     /// arrives must not leave the microphone live until the next press.
-    public var maxListenSeconds: TimeInterval = 15
+    ///
+    /// This is the last-resort backstop, not the hold limit. The hold limit
+    /// is `PushToTalk.maxHoldNs`, which the app enforces (and which the event
+    /// tap's lost-key-up recovery backs up). A ceiling here shorter than that
+    /// cut legitimate holds short: at 15 s it ended a 16 s description while
+    /// the key was still down and acted on half a sentence. So it sits just
+    /// past the push-to-talk limit and only fires if that one did not.
+    public var maxListenSeconds: TimeInterval = Voice.listenCeiling(forMaxHoldNs: PushToTalk().maxHoldNs)
+
+    /// The backstop for a hold limit of `maxHoldNs`: the limit plus a second.
+    public static func listenCeiling(forMaxHoldNs maxHoldNs: UInt64) -> TimeInterval {
+        Double(maxHoldNs) / 1e9 + 1
+    }
 
     public private(set) var isListening = false
 

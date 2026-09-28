@@ -62,7 +62,11 @@ public final class WarmCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private let outputQueue = DispatchQueue(label: "coach.capture.output", qos: .userInteractive)
     private let lock = NSLock()
     private var latest: Frame?
-    private var firstFrameContinuation: CheckedContinuation<Void, Never>?
+    private let firstFrame = FirstFrameGate()
+
+    /// How long `start` waits for the first complete frame before giving up
+    /// with `CaptureError.noFrameYet`.
+    public var firstFrameTimeout: TimeInterval = 5
 
     /// Metal-backed and built once. A fresh `CIContext` per conversion would
     /// pay Metal pipeline setup on the measured path and report a capture
@@ -160,26 +164,43 @@ public final class WarmCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Starts the stream and returns only once a first `.complete` frame has
     /// landed, so the caller genuinely has a warm stream rather than a
     /// started one. The returned value is the cold-start cost.
+    ///
+    /// Throws if the stream stops before its first frame (the user clicked
+    /// Stop on the screen-sharing indicator, the display slept, the window
+    /// closed) or no frame arrives within `firstFrameTimeout`, rather than
+    /// waiting for ever.
     @discardableResult
     public func start(filter: SCContentFilter, config: SCStreamConfiguration) async throws -> Double {
         let t0 = Mono.nowNs()
         let s = SCStream(filter: filter, configuration: config, delegate: self)
         try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: outputQueue)
+        firstFrame.reset()
         try await s.startCapture()
-        stream = s
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            lock.lock()
-            if latest != nil { lock.unlock(); c.resume(); return }
-            firstFrameContinuation = c
-            lock.unlock()
+        setStream(s)
+        do {
+            try await firstFrame.wait(timeout: firstFrameTimeout)
+        } catch {
+            if let current = takeStream() { try? await current.stopCapture() }
+            throw error
         }
         return Mono.msSince(t0)
     }
 
     public func stop() async {
-        guard let s = stream else { return }
+        guard let s = takeStream() else { return }
         try? await s.stopCapture()
+    }
+
+    // Synchronous, so the lock is never held across a suspension point.
+    private func setStream(_ s: SCStream) {
+        lock.lock(); stream = s; lock.unlock()
+    }
+
+    private func takeStream() -> SCStream? {
+        lock.lock(); defer { lock.unlock() }
+        let s = stream
         stream = nil
+        return s
     }
 
     /// The newest complete frame, with its age. Never blocks.
@@ -246,14 +267,84 @@ public final class WarmCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         completeFrames += 1
         latest = Frame(pixelBuffer: pixels, capturedAtNs: Mono.nowNs(),
                        contentRect: contentRect, contentScale: scale)
-        let waiter = firstFrameContinuation
-        firstFrameContinuation = nil
         lock.unlock()
-        waiter?.resume()
+        firstFrame.open()
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
         NSLog("ScreenCoach: capture stream stopped: \(error.localizedDescription)")
+        lock.lock()
+        if self.stream === stream { self.stream = nil }
+        lock.unlock()
+        // A `start` still waiting for its first frame gets the error now
+        // instead of never.
+        firstFrame.fail(error)
+    }
+}
+
+/// A one-shot "the first frame has arrived" signal that can also fail or
+/// time out, so a waiter is always resumed exactly once.
+///
+/// `open()` before `wait` makes `wait` return at once; `fail` before it makes
+/// `wait` throw at once. `reset()` arms it again for the next start.
+final class FirstFrameGate: @unchecked Sendable {
+    private enum State { case pending, opened, failed(Error) }
+    private let lock = NSLock()
+    private var state: State = .pending
+    private var waiter: CheckedContinuation<Void, Error>?
+    private var generation = 0
+
+    func reset() {
+        lock.lock()
+        state = .pending
+        generation += 1
+        let w = waiter
+        waiter = nil
+        lock.unlock()
+        w?.resume(throwing: CancellationError())
+    }
+
+    func open() {
+        lock.lock()
+        guard case .pending = state else { lock.unlock(); return }
+        state = .opened
+        let w = waiter
+        waiter = nil
+        lock.unlock()
+        w?.resume()
+    }
+
+    func fail(_ error: Error) {
+        lock.lock()
+        guard case .pending = state else { lock.unlock(); return }
+        state = .failed(error)
+        let w = waiter
+        waiter = nil
+        lock.unlock()
+        w?.resume(throwing: error)
+    }
+
+    func wait(timeout: TimeInterval) async throws {
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            switch state {
+            case .opened:
+                lock.unlock(); c.resume(); return
+            case .failed(let e):
+                lock.unlock(); c.resume(throwing: e); return
+            case .pending:
+                waiter = c
+                let mine = generation
+                lock.unlock()
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
+                    guard let self else { return }
+                    self.lock.lock()
+                    let current = self.generation == mine
+                    self.lock.unlock()
+                    if current { self.fail(WarmCapture.CaptureError.noFrameYet) }
+                }
+            }
+        }
     }
 }
 
