@@ -19,7 +19,23 @@ import ScreenCoachKit
 struct Bench {
 
     static func main() async {
-        // Touch NSApplication on the main thread before anything else.
+        let args = Array(CommandLine.arguments.dropFirst())
+        // Nothing that touches another app or the display runs unless it was
+        // named: `--help`, a stray flag or no arguments at all used to fall
+        // through to `all`, which walks every running app's tree and captures
+        // the screen.
+        let cmd: BenchCommand
+        switch BenchCommand.parse(args) {
+        case .help:
+            print(BenchCommand.usage)
+            exit(0)
+        case .usageError(let message):
+            FileHandle.standardError.write(Data((message + "\n\n" + BenchCommand.usage + "\n").utf8))
+            exit(2)
+        case .run(let command):
+            cmd = command
+        }
+        // Touch NSApplication on the main thread before any subcommand runs.
         //
         // A bare executable has no window-server connection until something
         // asks AppKit for one, and window-scoped ScreenCaptureKit queries
@@ -30,20 +46,18 @@ struct Bench {
         // NSApplicationMain.
         _ = NSApplication.shared
 
-        let args = Array(CommandLine.arguments.dropFirst())
-        let cmd = args.first.flatMap { $0.hasPrefix("--") ? nil : $0 } ?? "all"
         let opts = Options(args)
 
         switch cmd {
-        case "doctor":  doctor()
-        case "ax":      await benchAX(opts)
-        case "coldwarm": benchColdWarm(opts)
-        case "snap":    await snap(opts, args: args)
-        case "staleness": await benchStaleness(opts)
-        case "budget":
+        case .doctor:  doctor()
+        case .ax:      await benchAX(opts)
+        case .coldwarm: benchColdWarm(opts)
+        case .snap:    await snap(opts, args: args)
+        case .staleness: await benchStaleness(opts)
+        case .budget:
             exit(BudgetCheck.run(trials: opts.trials,
                                  includeVision: args.contains("--vision")))
-        case "exclusions":
+        case .exclusions:
             // Proves the live watcher, not just that the file parses: a
             // running process must pick up an edit before the next query, or
             // "excluding your bank" realistically means "restart the coach",
@@ -70,73 +84,38 @@ struct Bench {
             // deinit stops the watcher; pin it until the window closes.
             withExtendedLifetime(store) {}
             print("  \(seen) live reload(s) observed")
-        case "windows":
+        case .windows:
             // Which windows ScreenCaptureKit will actually hand over — not
             // the same set as "apps with an AX window", as Calendar proved.
             if let content = try? await SCShareableContent.excludingDesktopWindows(
                 true, onScreenWindowsOnly: true) {
                 header("SHAREABLE WINDOWS")
+                // Titles of excluded windows are exactly what the list exists
+                // to keep out of view, so they are not printed either.
+                let rules = ExclusionStore().current
                 for w in content.windows.sorted(by: {
                     $0.frame.width * $0.frame.height > $1.frame.width * $1.frame.height
                 }) where w.frame.width >= 120 && w.frame.height >= 60 {
+                    let excluded = rules.check(bundleID: w.owningApplication?.bundleIdentifier,
+                                               windowTitle: w.title).excluded
                     print("  " + (w.owningApplication?.applicationName ?? "?").clipped(22).pad(24)
                           + String(format: "%5.0f×%-5.0f at (%5.0f,%5.0f)  onScreen=%@  ",
                                    w.frame.width, w.frame.height, w.frame.minX, w.frame.minY,
                                    w.isOnScreen ? "y" : "n")
-                          + (w.title ?? "untitled").clipped(40))
+                          + (excluded ? "(excluded)" : (w.title ?? "untitled").clipped(40)))
                 }
             }
-        case "axplan":
+        case .axplan:
             exit(AXPlan.command(args, targets: opts.targets))
-        case "dump":    dumpTree(opts)
-        case "apps":    surveyApps(opts)
-        case "capture": await benchCapture(opts)
-        case "hotkey":  await benchHotkey(opts)
-        case "all":
+        case .dump:    dumpTree(opts)
+        case .apps:    surveyApps(opts)
+        case .capture: await benchCapture(opts)
+        case .hotkey:  await benchHotkey(opts)
+        case .all:
             doctor()
             await benchAX(opts)
             surveyApps(opts)
             await benchCapture(opts)
-        default:
-            print("""
-            screencoach-bench — Phase 0 latency harness
-
-            USAGE
-              screencoach-bench <command> [options]
-
-            COMMANDS
-              doctor    Permissions and environment
-              ax        AX tree extraction timing (batched vs per-attribute)
-              coldwarm  First-touch vs steady-state AX cost, and how fast
-                        warmth decays — decides speculative extraction
-              apps      Survey every running app: groundability + extraction cost
-              dump      Print the frontmost window's AX tree with bounds
-              capture   Compare screencapture(1), SCScreenshotManager, warm SCStream
-              hotkey    Interactive: real key press → frame in hand
-              snap      Save the frontmost window as PNG + its AX tree as JSON,
-                        for the vision-grounding benchmark to work against
-              axplan    Resolver hit rate + AX-aimed crop plans, from a snapshot
-              budget    Measure every stage against LatencyBudget; non-zero exit
-                        on violation, so it can gate CI. --vision includes the
-                        model (slow, and loads 5.6 GB)
-              exclusions  Watch the privacy list reload live
-              all       doctor + ax + apps + capture
-
-            OPTIONS
-              --trials N     Trials per measurement (default 30)
-              --app NAME     Target a named running app instead of the frontmost
-              --delay SEC    Countdown before measuring, to go focus something
-              --scope S      capture scope: display | window   (default window)
-              --max-nodes N  AX node cap (default 2500)
-              --deadline MS  AX walk deadline (default 250)
-              --targets N    Targets to measure in axplan (default 12)
-              --data PATH    Snapshot JSON for axplan
-                             (default bench-data/google-chrome.json)
-              --out PATH     Output path; for axplan a file or a directory
-                             (default bench-data/axplan-chrome.json, or
-                             <snapshot>-axplan.json beside a given --data)
-              --verbose      Per-trial detail
-            """)
         }
     }
 
@@ -220,10 +199,7 @@ struct Bench {
             return
         }
 
-        guard let target = resolveTarget(o) else {
-            print("  No target app.")
-            return
-        }
+        guard let target = resolveTarget(o) else { return }
         print("  Target: \(target.name) (pid \(target.pid))\n")
 
         let space = DisplaySpace.current()
@@ -299,6 +275,8 @@ struct Bench {
             print("  No capturable window\(o.app.map { " matching \"\($0)\"" } ?? "")."); return
         }
         let appName = w.owningApplication?.applicationName ?? "unknown"
+        guard !isExcluded(name: appName, bundleID: w.owningApplication?.bundleIdentifier,
+                          windowTitle: w.title) else { return }
         let filter = SCContentFilter(desktopIndependentWindow: w)
         let config = WarmCapture.configuration(for: filter)
 
@@ -438,10 +416,15 @@ struct Bench {
             }
             return
         }
-        if let data = try? JSONSerialization.data(withJSONObject: payload,
-                                                  options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: URL(fileURLWithPath: jsonPath))
+        // Report the path only once the file is really there: a snapshot that
+        // silently failed to write would leave `axplan` measuring a stale one.
+        do {
+            let data = try JSONSerialization.data(withJSONObject: payload,
+                                                  options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: jsonPath), options: .atomic)
             print("  \(jsonPath)  \(items.count) labelled actionable targets as ground truth")
+        } catch {
+            AXPlan.printError("Could not write \(jsonPath): \(error.localizedDescription)")
         }
     }
 
@@ -464,7 +447,7 @@ struct Bench {
         countdown(o.delay)
         header("AX COLD vs WARM")
         guard AXExtractor.isTrusted else { print("  Accessibility not granted."); return }
-        guard let target = resolveTarget(o) else { print("  No target app."); return }
+        guard let target = resolveTarget(o) else { return }
 
         let space = DisplaySpace.current()
         func walk() -> AXTreeSnapshot? {
@@ -529,17 +512,36 @@ struct Bench {
         let apps = NSWorkspace.shared.runningApplications
             .filter { $0.activationPolicy == .regular && !$0.isTerminated }
             .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+        // The same gate the app applies: an excluded app's tree is never
+        // opened, so a survey of "every app" is every app the user allows.
+        let rules = ExclusionStore().current
+
+        func skippedRow(_ name: String, _ reason: String) {
+            print("  " + name.clipped(24).pad(24) + "—".padLeft(9) + "—".padLeft(9)
+                  + "—".padLeft(7) + "—".padLeft(8) + "—".padLeft(8) + "—".padLeft(10)
+                  + "  " + reason)
+        }
 
         for app in apps {
             let name = app.localizedName ?? "pid \(app.processIdentifier)"
+            let verdict = rules.check(bundleID: app.bundleIdentifier, windowTitle: nil)
+            if verdict.excluded {
+                skippedRow(name, "skipped: \(verdict.reason ?? "excluded")")
+                continue
+            }
             guard let snap = try? AXExtractor.windowTree(
                 pid: app.processIdentifier, appName: name,
                 bundleID: app.bundleIdentifier, strategy: .batched,
                 limits: o.limits, displays: space
             ) else {
-                print("  " + name.clipped(24).pad(24) + "—".padLeft(9) + "—".padLeft(9)
-                      + "—".padLeft(7) + "—".padLeft(8) + "—".padLeft(8) + "—".padLeft(10)
-                      + "  no focused window over AX")
+                skippedRow(name, "no focused window over AX")
+                continue
+            }
+            // A title rule can only be checked once the window is known; stop
+            // there, before the five warm walks, and report nothing from it.
+            let titled = rules.check(bundleID: nil, windowTitle: snap.windowTitle)
+            if titled.excluded {
+                skippedRow(name, "skipped: \(titled.reason ?? "excluded")")
                 continue
             }
             var warmValues: [Double] = []
@@ -569,12 +571,14 @@ struct Bench {
     static func dumpTree(_ o: Options) {
         countdown(o.delay)
         guard AXExtractor.isTrusted else { print("Accessibility not granted."); return }
-        guard let target = resolveTarget(o) else { print("No target app."); return }
+        guard let target = resolveTarget(o) else { return }
         let space = DisplaySpace.current()
         guard let snap = try? AXExtractor.windowTree(
             pid: target.pid, appName: target.name, bundleID: target.bundle,
             strategy: .batched, limits: o.limits, displays: space
         ) else { print("Extraction failed for \(target.name)"); return }
+        guard !isExcluded(name: target.name, bundleID: nil,
+                          windowTitle: snap.windowTitle) else { return }
 
         header("AX TREE: \(snap.appName)")
         print("  window: \(snap.windowTitle ?? "untitled")")
@@ -726,6 +730,9 @@ struct Bench {
         guard let w = try? await WarmCapture.frontmostWindow(named: o.app) else {
             print("  No capturable window."); return
         }
+        guard !isExcluded(name: w.owningApplication?.applicationName ?? "unknown",
+                          bundleID: w.owningApplication?.bundleIdentifier,
+                          windowTitle: w.title) else { return }
         let filter = SCContentFilter(desktopIndependentWindow: w)
         let config = WarmCapture.configuration(for: filter)
         let warm = WarmCapture()
@@ -910,8 +917,12 @@ struct Bench {
 
     struct Target { let pid: pid_t; let name: String; let bundle: String? }
 
+    /// The app to measure, or nil (having said why) when there is none or the
+    /// user's exclusion list covers it. Every AX-walking subcommand comes through
+    /// here, so the list is consulted before the first AX call on the app.
     static func resolveTarget(_ o: Options) -> Target? {
         let running = NSWorkspace.shared.runningApplications
+        let target: Target
         if let wanted = o.app?.lowercased() {
             guard let app = running.first(where: {
                 ($0.localizedName ?? "").lowercased().contains(wanted)
@@ -920,14 +931,33 @@ struct Bench {
                 print("  No running app matching \"\(o.app!)\".")
                 return nil
             }
-            return Target(pid: app.processIdentifier,
-                          name: app.localizedName ?? "pid \(app.processIdentifier)",
-                          bundle: app.bundleIdentifier)
+            target = Target(pid: app.processIdentifier,
+                            name: app.localizedName ?? "pid \(app.processIdentifier)",
+                            bundle: app.bundleIdentifier)
+        } else {
+            guard let front = NSWorkspace.shared.frontmostApplication else {
+                print("  No target app.")
+                return nil
+            }
+            target = Target(pid: front.processIdentifier,
+                            name: front.localizedName ?? "pid \(front.processIdentifier)",
+                            bundle: front.bundleIdentifier)
         }
-        guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
-        return Target(pid: front.processIdentifier,
-                      name: front.localizedName ?? "pid \(front.processIdentifier)",
-                      bundle: front.bundleIdentifier)
+        if isExcluded(name: target.name, bundleID: target.bundle, windowTitle: nil) {
+            return nil
+        }
+        return target
+    }
+
+    /// Checks the user's exclusion list the way the app does and, when it
+    /// refuses, says why. The file is re-read each call: these are one-shot
+    /// commands, and an edit made just before running one must count.
+    static func isExcluded(name: String, bundleID: String?, windowTitle: String?,
+                           rules: ExclusionList = ExclusionStore().current) -> Bool {
+        let verdict = rules.check(bundleID: bundleID, windowTitle: windowTitle)
+        guard verdict.excluded else { return false }
+        print("  \(name) is on the exclusion list (\(verdict.reason ?? "excluded")): skipped.")
+        return true
     }
 
     static func countdown(_ seconds: Int) {

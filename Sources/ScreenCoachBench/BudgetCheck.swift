@@ -22,7 +22,15 @@ enum BudgetCheck {
         }
 
         let trace = LatencyTrace()
+        // The user's own rules, loaded before the cache starts: the privacy
+        // gate must decide before the first AX call on an app, here as in
+        // the app. Without this the bench's cache would walk anything.
+        let rules = ExclusionStore().current
         let cache = AXCache()
+        cache.exclusionCheck = { bundleID, title in
+            let v = rules.check(bundleID: bundleID, windowTitle: title)
+            return v.excluded ? (v.reason ?? "excluded") : nil
+        }
         cache.start()
         defer { cache.stop() }
 
@@ -31,7 +39,11 @@ enum BudgetCheck {
         // number the shipping app never pays.
         Thread.sleep(forTimeInterval: 0.5)
         guard let tree = cache.tree() else {
-            print("  No accessible frontmost window: focus an app and re-run.")
+            if let why = cache.lastExclusionReason {
+                print("  The frontmost app is on the exclusion list (\(why)): skipped.")
+            } else {
+                print("  No accessible frontmost window: focus an app and re-run.")
+            }
             return 3
         }
         let bounds = extent(of: tree)
@@ -70,13 +82,14 @@ enum BudgetCheck {
         //
         // So this is reported as information about the vision path rather than
         // as a budget stage, and `hotkeyToFrame` is honestly left unmeasured.
-        // The user's own rules, not only the defaults: the bench captures
-        // the same display the app would, so it cuts out the same windows.
-        let rules = ExclusionStore().current
+        // The user's own rules (loaded above), not only the defaults, and
+        // only the target app's windows: the bench captures the same frame
+        // the app's vision path would.
         var captureMs: [Double] = []
         for _ in 0..<Swift.min(trials, 10) {
             let t0 = Mono.nowNs()
-            if ScreenGrab.display(containing: bounds, exclusions: rules) != nil {
+            if ScreenGrab.display(containing: bounds, exclusions: rules,
+                                  targetPID: tree.pid) != nil {
                 captureMs.append(Mono.msSince(t0))
             }
         }
@@ -87,7 +100,8 @@ enum BudgetCheck {
                 modelPath: FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent("models/holo1.5-7b-4bit").path)
             if service.startIfNeeded(),
-               let shot = ScreenGrab.display(containing: bounds, exclusions: rules) {
+               let shot = ScreenGrab.display(containing: bounds, exclusions: rules,
+                                             targetPID: tree.pid) {
                 let hint = AXResolver.cropHint(query: pool[0], in: tree.nodes,
                                                windowBounds: bounds)
                 let crop = hint.isWholeWindow ? nil : CGRect(

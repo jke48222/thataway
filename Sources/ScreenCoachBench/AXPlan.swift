@@ -194,7 +194,11 @@ enum AXPlan {
     /// predates node capture and holds targets only, so defaulting to it made
     /// the documented command fail on a clean clone.
     static let defaultDataPath = "bench-data/google-chrome.json"
-    /// Where the README, `holo_axcrop.py` and the findings expect that plan.
+    /// The committed plan the README cites and `holo_axcrop.py` reads. A run
+    /// never writes here unless `--out` names it: a fresh plan differs from
+    /// the committed one (timings, and the bookmark rows redacted after the
+    /// run), so a no-flag run writes this file's name into the temporary
+    /// directory instead.
     static let defaultOutPath = "bench-data/axplan-chrome.json"
     /// The Chrome snapshot yields exactly 12 deduplicated targets, and the
     /// cited result is "12 of 12"; any lower default silently measures less.
@@ -209,16 +213,22 @@ enum AXPlan {
     /// Resolve `axplan`'s flags into paths, without touching the filesystem
     /// beyond asking whether `--out` names a directory.
     ///
-    /// - `--data` omitted: the Chrome snapshot, written to the cited plan.
-    /// - `--data` given, `--out` omitted: `<stem>-axplan.json` beside the
-    ///   snapshot, the first name `live_eval.py` looks for. Falling back to a
-    ///   single shared file would let one app's plan overwrite another's.
+    /// - `--data` omitted: the Chrome snapshot, written to
+    ///   `axplan-chrome.json` in `temporaryDirectory`.
+    /// - `--data` given, `--out` omitted: `<stem>-axplan.json` in
+    ///   `temporaryDirectory`. A per-snapshot name, so one app's plan never
+    ///   overwrites another's.
     /// - `--out` names a directory: the same derived filename inside it.
+    ///
+    /// Without `--out` nothing is written into the repository: the committed
+    /// plans under `bench-data/` are evidence the README and the vision
+    /// harnesses read, and a fresh run would silently replace them.
     ///
     /// A flag with no value (`axplan --data`) is an error, not a crash.
     static func parseInvocation(
         _ args: [String], targets: Int?,
-        isDirectory: (String) -> Bool = AXPlan.isDirectory
+        isDirectory: (String) -> Bool = AXPlan.isDirectory,
+        temporaryDirectory: String = NSTemporaryDirectory()
     ) -> Result<Invocation, InvocationError> {
         func value(of flag: String) -> Result<String?, InvocationError> {
             guard let i = args.lastIndex(of: flag) else { return .success(nil) }
@@ -246,11 +256,8 @@ enum AXPlan {
                 .deletingPathExtension + "-axplan.json"
         let outPath: String
         switch out {
-        case nil where data == nil:
-            outPath = defaultOutPath
         case nil:
-            outPath = ((dataPath as NSString).deletingLastPathComponent as NSString)
-                .appendingPathComponent(derivedName)
+            outPath = (temporaryDirectory as NSString).appendingPathComponent(derivedName)
         case let o? where o.hasSuffix("/") || isDirectory(o):
             outPath = (o as NSString).appendingPathComponent(derivedName)
         case let o?:
