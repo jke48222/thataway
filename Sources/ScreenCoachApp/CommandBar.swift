@@ -1,5 +1,6 @@
 import AppKit
 import ScreenCoachCore
+import ScreenCoachKit
 
 /// The "what are you looking for" input.
 ///
@@ -27,6 +28,17 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
     /// the way out is not mistaken for the user clicking away.
     private var isDismissing = false
     private var lastAnnouncedSuggestion: String?
+    /// The pending announcement of the top suggestion. Debounced so that a
+    /// VoiceOver user's typing echo is not cut off on every keystroke that
+    /// changes the leader.
+    private var suggestionAnnouncement: DispatchWorkItem?
+
+    /// The microphone is open. Nothing is announced while it is: VoiceOver
+    /// speaking over the speakers is heard by the recogniser and ends up in
+    /// the transcript. The final answer is announced after the hold ends.
+    public var isListening = false {
+        didSet { if isListening { cancelSuggestionAnnouncement() } }
+    }
 
     /// Fires as the user types, so candidates can be previewed live.
     public var onQueryChanged: ((String) -> Void)?
@@ -39,7 +51,10 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
         super.init(contentRect: CGRect(x: 0, y: 0, width: Self.width, height: 58),
                    styleMask: [.borderless, .nonactivatingPanel, .titled, .fullSizeContentView],
                    backing: .buffered, defer: false)
-        level = .floating
+        // Above the overlay (`.screenSaver`), not under it: summoning the
+        // coach mid-lesson must not put the field under the lesson's dimming
+        // scrim. The overlay is click-through, so nothing is lost above it.
+        level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         titleVisibility = .hidden
         titlebarAppearsTransparent = true
@@ -50,6 +65,11 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         animationBehavior = .none
+        // Kept out of screen capture, like OverlayPanel. ScreenGrab already
+        // cuts the coach's process from the vision frame; this also covers a
+        // bar ordered in after the shareable content was listed, so the
+        // query the user typed is never part of what the model sees.
+        sharingType = .none
 
         let container = NSVisualEffectView()
         container.material = .hudWindow
@@ -72,7 +92,18 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
         field.setAccessibilityLabel("Control to point at")
         field.translatesAutoresizingMaskIntoConstraints = false
 
-        Self.configureSingleLine(hint)
+        // The status line wraps to three lines rather than truncating: its
+        // text is the permission instructions and the reason for a miss,
+        // and those are exactly the parts a one-line tail truncation cut.
+        // fitToContent grows the bar to fit.
+        hint.usesSingleLineMode = false
+        hint.maximumNumberOfLines = Self.hintMaxLines
+        hint.lineBreakMode = .byWordWrapping
+        hint.cell?.wraps = true
+        hint.cell?.truncatesLastVisibleLine = true
+        hint.preferredMaxLayoutWidth = Self.width - 2 * Self.sideInset
+        hint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        hint.setContentCompressionResistancePriority(.required, for: .vertical)
         hint.font = .systemFont(ofSize: 11, weight: .regular)
         hint.textColor = .secondaryLabelColor
         hint.translatesAutoresizingMaskIntoConstraints = false
@@ -110,6 +141,8 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
         fitToContent()
     }
 
+    static let hintMaxLines = 3
+
     public override var canBecomeKey: Bool { true }
 
     /// Clicking back into the app underneath dismisses the bar, the way
@@ -124,31 +157,49 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
 
     // MARK: - Presentation
 
-    public func present(status: String) {
-        hint.stringValue = status
+    /// Show the bar and take the keyboard.
+    ///
+    /// Only for a direct result of something the user just did (the hotkey,
+    /// the menu, Return). The bar is a non-activating panel: made key from
+    /// an asynchronous completion, it takes the keystrokes of whatever app
+    /// the user has gone back to.
+    ///
+    /// - `query`: text to put back in the field, selected, so a miss can be
+    ///   rephrased instead of retyped. Empty for a fresh turn.
+    /// - `announce`: false while the microphone is open, or when the caller
+    ///   says the outcome some other way (speech), so VoiceOver does not
+    ///   talk over it.
+    public func present(status: String, query: String = "", announce: Bool = true) {
+        setHint(status)
         showSuggestions([])
-        field.stringValue = ""
+        field.stringValue = query
         positionOnActiveScreen()
         orderFrontRegardless()
         makeKey()
         field.becomeFirstResponder()
-        Self.announce(status)
+        if !query.isEmpty, let editor = field.currentEditor() {
+            editor.selectedRange = NSRange(location: 0, length: (query as NSString).length)
+        }
+        if announce && !isListening { Self.announce(status) }
     }
 
     public func dismiss() {
+        cancelSuggestionAnnouncement()
+        lastAnnouncedSuggestion = nil
         guard isVisible else { return }
         isDismissing = true
         orderOut(nil)
         isDismissing = false
-        lastAnnouncedSuggestion = nil
     }
 
     private func positionOnActiveScreen() {
         // The screen with the mouse, not `NSScreen.main`: the user's
         // attention is where their cursor is, and main only tracks focus.
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { $0.frame.contains(mouse) }
-            ?? NSScreen.main ?? NSScreen.screens[0]
+        let frames = NSScreen.screens.map(\.frame)
+        let index = DisplaySpace.appKitScreenIndex(containing: NSEvent.mouseLocation,
+                                                    in: frames)
+        guard let screen = index.flatMap({ NSScreen.screens[safe: $0] })
+                ?? NSScreen.main ?? NSScreen.screens.first else { return }
         let size = frame.size
         setFrameOrigin(CGPoint(
             x: screen.frame.midX - size.width / 2,
@@ -185,9 +236,12 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
     ///
     /// The top row is what Return will pick, so it reads at full contrast;
     /// the rest are secondary, which still clears 4.5:1 on the HUD material.
-    public func showSuggestions(_ rows: [String]) {
+    ///
+    /// The score is drawn but never spoken: VoiceOver hears the label alone.
+    public func showSuggestions(_ rows: [(score: Double, label: String)]) {
         for v in suggestionRows { stack.removeArrangedSubview(v); v.removeFromSuperview() }
-        suggestionRows = rows.prefix(3).enumerated().map { i, text in
+        suggestionRows = rows.prefix(3).enumerated().map { i, row in
+            let text = String(format: "%.2f  %@", row.score, row.label)
             let l = NSTextField(labelWithString: text)
             Self.configureSingleLine(l)
             let top = i == 0
@@ -205,19 +259,44 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
         stack.isHidden = suggestionRows.isEmpty
         fitToContent()
 
-        // VoiceOver hears the candidate Return would pick, once per change,
-        // rather than every keystroke.
-        let top = rows.first
-        if top != lastAnnouncedSuggestion {
-            lastAnnouncedSuggestion = top
-            if let top, isVisible { Self.announce(top) }
+        // VoiceOver hears the candidate Return would pick, once per change
+        // and only once typing pauses, at a priority that does not cut off
+        // the echo of the character just typed. Never while the microphone
+        // is open: it would be transcribed.
+        let top = rows.first?.label
+        guard top != lastAnnouncedSuggestion else { return }
+        lastAnnouncedSuggestion = top
+        cancelSuggestionAnnouncement()
+        guard let top, isVisible, !isListening else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isVisible, !self.isListening,
+                  self.lastAnnouncedSuggestion == top else { return }
+            Self.announce(top, priority: .medium)
         }
+        suggestionAnnouncement = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.suggestionAnnounceDelay,
+                                      execute: work)
+    }
+
+    static let suggestionAnnounceDelay: TimeInterval = 0.4
+
+    private func cancelSuggestionAnnouncement() {
+        suggestionAnnouncement?.cancel()
+        suggestionAnnouncement = nil
     }
 
     public func setStatus(_ text: String) {
         guard text != hint.stringValue else { return }
+        setHint(text)
+        fitToContent()
+        if isVisible && !isListening { Self.announce(text) }
+    }
+
+    private func setHint(_ text: String) {
         hint.stringValue = text
-        if isVisible { Self.announce(text) }
+        // Wrapped to three lines, a very long status can still be cut; the
+        // tooltip always has all of it.
+        hint.toolTip = text
     }
 
     /// Push a transcript in from voice. Same field as typing, so everything
@@ -241,14 +320,15 @@ public final class CommandBar: NSPanel, NSTextFieldDelegate {
     /// silently otherwise, and the overlay is click-through and outside the
     /// accessibility hierarchy, so for a VoiceOver user a typed query's
     /// outcome would be purely visual.
-    public static func announce(_ text: String) {
+    public static func announce(_ text: String,
+                                priority: NSAccessibilityPriorityLevel = .high) {
         guard !text.isEmpty, NSWorkspace.shared.isVoiceOverEnabled else { return }
         NSAccessibility.post(
             element: NSApp as Any,
             notification: .announcementRequested,
             userInfo: [
                 .announcement: text,
-                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+                .priority: priority.rawValue,
             ]
         )
     }
