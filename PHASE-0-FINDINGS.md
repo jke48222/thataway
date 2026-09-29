@@ -4,7 +4,7 @@ Machine: **Apple M5 Pro, 24 GB unified, macOS 27.0 (26A5378j)**, single
 1512×982 @2x display. Swift 6.3.3, MLX 0.32.1.
 
 Everything below is measured on this machine with
-`Sources/ScreenCoachBench`. Percentiles are nearest-rank over the stated trial
+`Sources/ThatawayBench`. Percentiles are nearest-rank over the stated trial
 count, so every figure is a number some trial actually produced.
 
 ---
@@ -462,7 +462,7 @@ swift test && swift build -c release
 ```
 
 ```bash
-./.build/release/screencoach-bench all --deadline 2000
+./.build/release/thataway-bench all --deadline 2000
 ```
 
 ```bash
@@ -470,8 +470,15 @@ python3 Tools/holo_sweep.py --data bench-data/logic-pro.json --targets 10
 ```
 
 ```bash
-./.build/release/screencoach-bench axplan --data bench-data/google-chrome.json --targets 12
+./.build/release/thataway-bench axplan --data bench-data/google-chrome.json --targets 12 \
+  --out /tmp/axplan-chrome.json
 ```
+
+This writes outside the repository so the committed `bench-data/axplan-chrome.json`, which the
+next command reads, is never overwritten; `live_eval.py` likewise reads the committed
+`bench-data/google-chrome-axplan.json` beside the snapshot. A fresh run reproduces the 12/12 hit
+rate; the timings vary by machine, and the three bookmark rows differ because their titles were
+replaced with placeholders in the snapshot and the plan after the run.
 
 ```bash
 cd Tools && python3 holo_axcrop.py --data ../bench-data/google-chrome.json --plan ../bench-data/axplan-chrome.json
@@ -481,7 +488,7 @@ Not yet run — needs a human at the keyboard, since it times real key presses
 from the hardware event timestamp:
 
 ```bash
-./.build/release/screencoach-bench hotkey --trials 10
+./.build/release/thataway-bench hotkey --trials 10
 ```
 
 Raw results are in `bench-data/`: `holo-7b-bf16.json`, `holo-7b-4bit.json`,
@@ -491,7 +498,7 @@ Raw results are in `bench-data/`: `holo-7b-bf16.json`, `holo-7b-4bit.json`,
 
 # Phase 1 — It points, correctly
 
-Built: `ScreenCoachApp` — a menu-bar-only accessory app. Hotkey (⌥Space), type a
+Built: `ThatawayApp` — a menu-bar-only accessory app. Hotkey (⌥Space), type a
 target in plain language, and a cursor flies along a bezier arc to the exact
 control. **No voice, no vision model, no cloud, no network at all.**
 
@@ -569,14 +576,14 @@ app the user was working in, not the input box they are typing into.
 ## Running it
 
 ```bash
-bash Tools/make-app.sh && open build/ScreenCoach.app
+bash Tools/make-app.sh && open build/Thataway.app
 ```
 
 Then ⌥Space. Grant Accessibility when asked — it is the entire product; without
 it there is nothing to point at.
 
 ```bash
-./build/ScreenCoach.app/Contents/MacOS/ScreenCoach --selftest "the Today button" --app Calendar
+./build/Thataway.app/Contents/MacOS/Thataway --selftest "the Today button" --app Calendar
 ```
 
 Sign with a **stable identity**. Accessibility is TCC-keyed to the code
@@ -632,9 +639,13 @@ No frame was ever captured, and a private conversation leaked anyway — an
 accessibility tree carries the content, not merely the controls.
 
 So exclusion now means excluded: **no capture and no tree**, checked before the
-first AX call. Title-pattern rules are evaluated against the window title from
-`CGWindowList` rather than AX, so testing whether an app is excluded never
-requires reading the app.
+first AX call. Title-pattern rules are evaluated against the window server's
+title from `CGWindowList`. Only when Screen Recording is not granted, so the
+window server withholds titles, is the focused window's `AXTitle` read, as one
+attribute of an app whose bundle is already allowed. The vision frame holds only
+the target app's windows, so banners, widgets and other apps never reach the
+model, and it reaches the sidecar in memory, or as a 0600 temp file removed
+after the reply and swept on the next start.
 
 The trade is real and correct: the coach cannot help you inside your password
 manager.
@@ -664,7 +675,7 @@ degrade to accessibility-only rather than breaking.
 ## Fusion, and what earns a solid ring
 
 Agreement between two independent methods is the only thing that earns
-confidence. 16 tests pin the policy:
+confidence. 20 tests pin the policy:
 
 | tree | vision | result |
 |---|---|---|
@@ -672,16 +683,18 @@ confidence. 16 tests pin the policy:
 | weak | not run | uncertain, with the reason |
 | none | answered | **uncertain — always**, 58% is not a fact |
 | any | agrees (click inside the element) | **exact — corroborated** |
-| strong | disagrees | **uncertain**, points at the tree, states the gap in points |
+| strong (at or above 0.62) | disagrees | **uncertain**, points at the tree, states the gap in points |
+| weak (below 0.62) | disagrees | **uncertain**, points at vision's guess, names the tree candidate it overruled |
 | strong, screen 0 | same coords, screen 1 | conflicted, never agreement |
 
 Corroboration outranks either path alone: a *weak* AX match that vision
 independently lands inside is promoted to exact, while a strong AX match that
-vision contradicts is demoted to dashed.
+vision contradicts is demoted to dashed. A weak tree match never overrules the
+vision model it triggered.
 
 ## Live reload, verified rather than asserted
 
-`screencoach-bench exclusions` watches the file in a running process:
+`thataway-bench exclusions` watches the file in a running process:
 
 ```
 26 apps, 16 title patterns excluded
@@ -692,7 +705,7 @@ reload #3: 42 rules — Calendar allowed
 
 An edit takes effect before the next query, with no restart. A privacy control
 that needs a relaunch is one nobody uses. The file is plain text at
-`~/.config/screencoach/exclusions.conf`, seeded with the defaults on first run
+`~/.config/thataway/exclusions.conf`, seeded with the defaults on first run
 so what is excluded can be read rather than trusted. An empty or unparseable
 file falls back to the defaults, never to "allow everything".
 
@@ -735,7 +748,7 @@ the point of drawing the dashes.
 
 ## Finding 17 — The latency budget as a CI gate, and an honest unmeasured list
 
-`screencoach-bench budget` measures each stage against `LatencyBudget` and
+`thataway-bench budget` measures each stage against `LatencyBudget` and
 exits non-zero on violation:
 
 ```

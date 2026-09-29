@@ -12,7 +12,7 @@ published figure for this hardware:
   3. Does cropping to the window instead of feeding the whole display help,
      which is the specific claim the fallback design rests on.
 
-Ground truth comes from `screencoach-bench snap`, which writes a window PNG,
+Ground truth comes from `thataway-bench snap`, which writes a window PNG,
 a full-display PNG, and the AX bounds of every labelled actionable element in
 both pixel frames. A prediction counts as a hit when the predicted click lands
 inside the element's real box — the same criterion ScreenSpot-Pro uses.
@@ -85,9 +85,13 @@ def localization_prompt(target):
 
 
 def parse_click(text):
-    """Pull {x, y} out of the model's reply, tolerating stray prose."""
-    try:
-        start = text.index("{")
+    """Pull {x, y} out of the model's reply, tolerating stray prose around it.
+
+    Only a JSON object with numeric x and y counts. Numbers picked out of
+    prose do not: the model reads on-screen text, so a reply that quotes the
+    page could otherwise steer the pointer to coordinates the page chose.
+    """
+    for start in (i for i, ch in enumerate(text) if ch == "{"):
         depth, end = 0, None
         for i in range(start, len(text)):
             if text[i] == "{":
@@ -97,15 +101,18 @@ def parse_click(text):
                 if depth == 0:
                     end = i + 1
                     break
-        if end:
+        if end is None:
+            continue
+        try:
             obj = json.loads(text[start:end])
-            return float(obj["x"]), float(obj["y"])
-    except Exception:
-        pass
-    import re
-    nums = re.findall(r"-?\d+(?:\.\d+)?", text)
-    if len(nums) >= 2:
-        return float(nums[-2]), float(nums[-1])
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        x, y = obj.get("x"), obj.get("y")
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+               for v in (x, y)):
+            return float(x), float(y)
     return None
 
 

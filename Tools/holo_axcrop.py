@@ -13,7 +13,7 @@ Three conditions, one model, identical targets and prompts:
   crop3    the 3×3 grid cell containing the target, native resolution.
            Blind: it knows the target's position because the harness does,
            which makes it a generous baseline, not a realistic one.
-  axcrop   the crop `screencoach-bench axplan` derived from the accessibility
+  axcrop   the crop `thataway-bench axplan` derived from the accessibility
            tree with the target ABLATED — the tree never saw the element.
            Some of these fall back to the whole frame, and that counts.
 

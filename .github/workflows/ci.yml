@@ -1,0 +1,88 @@
+# Builds Thataway and runs the unit tests on every push and pull request to main.
+#
+# Runner: macos-26 (Apple silicon) is the newest generally available macOS image. We stay on the
+# newest *stable* Xcode that setup-xcode finds. The package targets macOS 14 with
+# swift-tools-version 5.9 and uses no SDK-gated APIs, so any Xcode 16 or later builds it.
+#
+# What CI deliberately does not run: every thataway-bench subcommand that reads the
+# accessibility tree, captures the screen, draws an overlay or moves the pointer (ax, coldwarm,
+# capture, budget, windows, and the rest), and the app's --selftest and --idlebench modes. They
+# need Accessibility and Screen Recording grants and a live app to measure, and a hosted runner has
+# neither. `doctor` only reads permission state without prompting, and `axplan` works from a
+# committed snapshot, so both are safe here.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & test
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Select newest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Test
+        run: swift test
+
+      # The vision sidecar's protocol and its no-frame-on-disk guarantee, with mlx_vlm stubbed out,
+      # and make-app.sh's bundle (sidecar copied in, valid Info.plist, entitlements on every signing
+      # branch) with swift, security and codesign stubbed. Needs only Pillow and plutil; Pillow goes
+      # into a throwaway venv so the runner's Python is left alone.
+      - name: Test the vision sidecar and app bundling
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pillow
+          "$RUNNER_TEMP/venv/bin/python" -B Tools/tests/test_holo_server.py
+          "$RUNNER_TEMP/venv/bin/python" -B Tools/tests/test_make_app.py
+
+      # Environment and permission preflight. Exits 0 with permissions reported as DENIED on a
+      # runner, which is expected; this step proves the release binary launches.
+      - name: Bench doctor
+        run: ./.build/release/thataway-bench doctor
+
+      # The README's resolver numbers come from this command. It reads only the committed
+      # Chrome snapshot, so it is headless, and the check fails the job if the plan is not
+      # written or the resolver stops answering all 12 targets.
+      - name: Reproduce the axplan resolver result
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/axplan-chrome.json"
+          ./.build/release/thataway-bench axplan \
+            --data bench-data/google-chrome.json --targets 12 --out "$out"
+          python3 - "$out" <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1]))
+          plans = plan["plans"]
+          assert len(plans) == 12, f"expected 12 plans, got {len(plans)}"
+          assert plan["ax_hit_rate"] == 1, f"ax_hit_rate {plan['ax_hit_rate']}, expected 1"
+          print(f"axplan: {len(plans)} targets, hit rate {plan['ax_hit_rate']}, "
+                f"resolve p50 {plan['resolve_p50_ms']:.3f} ms")
+          PY

@@ -15,23 +15,72 @@ bug.
 
 Protocol — one JSON object per line each way:
 
-    <- {"id":1,"image":"/tmp/f.png","query":"the Play button","crop":[x,y,w,h]}
+    <- {"id":1,"image_png_b64":"iVBOR...","query":"the Play button","crop":[x,y,w,h]}
+    <- {"id":1,"image":"/tmp/f.png","query":"the Play button"}   older callers
     -> {"id":1,"x":1131.0,"y":287.0,"ttft_ms":1610,"total_ms":1901,"tokens":980}
 
-    -> {"ready":true,"model":"...","load_s":0.5}      once, at startup
-    -> {"id":1,"error":"..."}                          on failure
+    -> {"ready":true,"inline_image":true,"model":"...","load_s":0.5}   once, at startup
+    -> {"id":1,"error":"..."}                                            on failure
+
+`inline_image` in the ready line tells the app it may send the frame as base64
+PNG in `image_png_b64`, so the frame never exists as a file. A request with
+only `image` (a path) is still read, for callers that predate that.
+
+Nothing the sidecar sees is written to disk. The caller's frame is decoded once
+and the crop/resize is handed to mlx_vlm as an in-memory PIL image. If an older
+mlx_vlm only accepts paths, the image goes to a per-request temp file in the
+private $TMPDIR, which is unlinked as soon as generation ends, including on
+error and on SIGTERM. SIGKILL skips that `finally`, so each start also removes
+holo-*.png files an earlier, killed run left behind.
 """
 
+import base64
+import contextlib
+import io
 import json
 import math
+import os
+import signal
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-from PIL import Image
-
+# The script may run from inside a signed .app bundle. Writing __pycache__
+# next to it would modify the bundle and break its code signature.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).parent))
-from holo_bench import localization_prompt, parse_click, smart_resize  # noqa: E402
+
+# A missing Pillow (or a broken holo_bench) is reported over the protocol as
+# {"ready": false, "error": ...} from main(), not as a traceback on stderr
+# that the app would have to scrape.
+try:
+    from PIL import Image
+    from holo_bench import localization_prompt, parse_click, smart_resize
+    IMPORT_ERROR = None
+except Exception as e:  # noqa: BLE001
+    Image = None
+    IMPORT_ERROR = f"{type(e).__name__}: {e}"
+
+# Earlier builds kept the last frame here for the sidecar's whole lifetime.
+# It is removed at startup so an upgrade also cleans up what they left behind.
+LEGACY_SCRATCH_NAME = ".holo_server_input.png"
+
+# A temp frame lives for one generation, a few seconds. One older than this was
+# left by a run that was SIGKILLed mid-query; a younger one may belong to a
+# second sidecar (the bench beside the app) and is left alone.
+STALE_FRAME_SECONDS = 300
+
+
+def sweep_stale_frames(directory=None, now=None):
+    """Delete holo-*.png temp frames a killed run left in `directory`."""
+    directory = Path(directory or tempfile.gettempdir())
+    now = time.time() if now is None else now
+    for path in directory.glob("holo-*.png"):
+        with contextlib.suppress(OSError):
+            st = path.lstat()
+            if st.st_uid == os.getuid() and now - st.st_mtime > STALE_FRAME_SECONDS:
+                path.unlink()
 
 
 def emit(obj):
@@ -39,10 +88,51 @@ def emit(obj):
     sys.stdout.flush()
 
 
+def accepts_pil_images():
+    """True when the installed mlx_vlm takes a PIL image (0.6.15 does)."""
+    try:
+        from mlx_vlm.utils import load_image
+        load_image(Image.new("RGB", (8, 8)))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@contextlib.contextmanager
+def model_image(image, in_memory):
+    """Yield what stream_generate's `image=` takes, leaving nothing on disk.
+
+    In memory when possible. Otherwise a private temp file (mode 0600, in
+    $TMPDIR, not the home folder) that is unlinked in `finally`, so it exists
+    only for the length of one generation.
+    """
+    if in_memory:
+        yield image
+        return
+    fd, path = tempfile.mkstemp(prefix="holo-", suffix=".png")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            image.save(f, format="PNG")
+        yield path
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+
+
+def _exit_on_sigterm(signum, frame):  # noqa: ARG001
+    # SystemExit unwinds through every `finally`, so a temp frame in flight is
+    # still deleted when the app terminates the sidecar.
+    raise SystemExit(0)
+
+
 def main():
     model_path = sys.argv[1] if len(sys.argv) > 1 else str(
         Path.home() / "models/holo1.5-7b-4bit")
     max_tokens = 48
+
+    if IMPORT_ERROR is not None:
+        emit({"ready": False, "error": IMPORT_ERROR})
+        return 1
 
     t0 = time.perf_counter()
     try:
@@ -54,10 +144,14 @@ def main():
     except Exception as e:  # noqa: BLE001
         emit({"ready": False, "error": f"{type(e).__name__}: {e}"})
         return 1
-    emit({"ready": True, "model": model_path,
-          "load_s": round(time.perf_counter() - t0, 2)})
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    with contextlib.suppress(OSError):
+        (Path(model_path).parent / LEGACY_SCRATCH_NAME).unlink(missing_ok=True)
+    sweep_stale_frames()
+    in_memory = accepts_pil_images()
 
-    scratch = Path(model_path).parent / ".holo_server_input.png"
+    emit({"ready": True, "inline_image": True, "model": model_path,
+          "load_s": round(time.perf_counter() - t0, 2)})
 
     for line in sys.stdin:
         line = line.strip()
@@ -72,7 +166,12 @@ def main():
 
         rid = req.get("id")
         try:
-            image = Image.open(req["image"]).convert("RGB")
+            if "image_png_b64" in req:
+                source = io.BytesIO(base64.b64decode(req["image_png_b64"], validate=True))
+            else:
+                source = req["image"]
+            with Image.open(source) as src:
+                image = src.convert("RGB")
 
             # Crop first, resize second. Doing it the other way round throws
             # away the resolution that makes small targets findable — Phase 0
@@ -94,19 +193,20 @@ def main():
             budget = req.get("max_pixels") or 3686400
             rh, rw = smart_resize(h, w, max_pixels=budget)
             resized = image.resize((rw, rh), Image.Resampling.LANCZOS)
-            resized.save(scratch)
 
             prompt = apply_chat_template(
                 processor, config, localization_prompt(req["query"]), num_images=1
             )
             start = time.perf_counter()
             ttft, text = None, ""
-            for chunk in stream_generate(model, processor, prompt, image=str(scratch),
-                                         max_tokens=req.get("max_tokens", max_tokens),
-                                         temperature=0.0):
-                if ttft is None:
-                    ttft = time.perf_counter() - start
-                text += chunk.text
+            with model_image(resized, in_memory) as model_input:
+                for chunk in stream_generate(model, processor, prompt,
+                                             image=model_input,
+                                             max_tokens=req.get("max_tokens", max_tokens),
+                                             temperature=0.0):
+                    if ttft is None:
+                        ttft = time.perf_counter() - start
+                    text += chunk.text
             total = time.perf_counter() - start
 
             click = parse_click(text)
@@ -126,7 +226,6 @@ def main():
         except Exception as e:  # noqa: BLE001
             emit({"id": rid, "error": f"{type(e).__name__}: {e}"})
 
-    scratch.unlink(missing_ok=True)
     return 0
 
 

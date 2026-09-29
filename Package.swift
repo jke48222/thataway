@@ -5,41 +5,60 @@
 import PackageDescription
 
 let package = Package(
-    name: "ScreenCoach",
+    name: "Thataway",
     platforms: [.macOS(.v14)],
     targets: [
         // Pure. No AppKit, no ApplicationServices, no ScreenCaptureKit.
         // Everything here is unit-testable headless — which is the point:
         // the coordinate-space trap and the latency budget are exactly the
         // things you want under test before hardware is involved.
-        .target(name: "ScreenCoachCore", path: "Sources/ScreenCoachCore"),
+        .target(name: "ThatawayCore", path: "Sources/ThatawayCore"),
 
         // The system-facing half: accessibility tree extraction, the warm
         // ScreenCaptureKit stream, the listen-only event tap.
         .target(
-            name: "ScreenCoachKit",
-            dependencies: ["ScreenCoachCore"],
-            path: "Sources/ScreenCoachKit"
+            name: "ThatawayKit",
+            dependencies: ["ThatawayCore"],
+            path: "Sources/ThatawayKit"
         ),
 
         // The app: menu-bar only, hotkey-summoned, points at real controls.
         .executableTarget(
-            name: "ScreenCoachApp",
-            dependencies: ["ScreenCoachKit", "ScreenCoachCore"],
-            path: "Sources/ScreenCoachApp"
+            name: "ThatawayApp",
+            dependencies: ["ThatawayKit", "ThatawayCore"],
+            path: "Sources/ThatawayApp"
         ),
 
         // Phase 0 measurement CLI. Produces the three numbers.
         .executableTarget(
-            name: "screencoach-bench",
-            dependencies: ["ScreenCoachKit", "ScreenCoachCore"],
-            path: "Sources/ScreenCoachBench"
+            name: "thataway-bench",
+            dependencies: ["ThatawayKit", "ThatawayCore"],
+            path: "Sources/ThatawayBench"
         ),
 
         .testTarget(
-            name: "ScreenCoachCoreTests",
-            dependencies: ["ScreenCoachCore"],
-            path: "Tests/ScreenCoachCoreTests"
+            name: "ThatawayCoreTests",
+            dependencies: ["ThatawayCore"],
+            path: "Tests/ThatawayCoreTests"
+        ),
+
+        // Kit's pure policies and its process/file plumbing: the hotkey state
+        // machine, capture exclusion plan, cache freshness, exclusion file
+        // reloads, lesson file limits and the sidecar protocol (against a
+        // stand-in Python script). Nothing here needs a display or any TCC
+        // permission.
+        .testTarget(
+            name: "ThatawayKitTests",
+            dependencies: ["ThatawayKit", "ThatawayCore"],
+            path: "Tests/ThatawayKitTests"
+        ),
+
+        // The bench CLI's argument handling, which the README's reproduce
+        // command and CI depend on.
+        .testTarget(
+            name: "ThatawayBenchTests",
+            dependencies: ["thataway-bench"],
+            path: "Tests/ThatawayBenchTests"
         ),
     ]
 )
