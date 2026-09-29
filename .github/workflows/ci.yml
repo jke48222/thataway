@@ -48,6 +48,17 @@ jobs:
       - name: Build (release)
         run: swift build -c release
 
+      # The promo stage that renders docs/media is Debug-only (#if DEBUG). Fail if any of it
+      # reaches the Release binary.
+      - name: Check the promo stage is compiled out of Release
+        run: |
+          set -euo pipefail
+          strings .build/release/ThatawayApp > "$RUNNER_TEMP/app-strings.txt"
+          if grep -qi 'promo' "$RUNNER_TEMP/app-strings.txt"; then
+            echo "::error::Release ThatawayApp contains promo stage strings"
+            exit 1
+          fi
+
       - name: Test
         run: swift test
 

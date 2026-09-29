@@ -249,6 +249,29 @@ final class ExclusionListTests: XCTestCase {
         XCTAssertTrue(v.reason?.contains("com.apple.passwords") ?? false)
     }
 
+    /// The bar's refusal names the rule once, in words, for both kinds. It
+    /// used to read "it is excluded (app is excluded (…))".
+    func testRefusalReadsOnceForABundleRule() throws {
+        let v = ExclusionList.defaults.check(bundleID: "com.apple.Passwords",
+                                             windowTitle: "Passwords")
+        let refusal = ExclusionList.refusal(appName: "Passwords", reason: try XCTUnwrap(v.reason))
+        XCTAssertEqual(refusal, "Not looking at Passwords: the app is on the exclusion "
+                              + "list (bundle: com.apple.passwords).")
+        XCTAssertEqual(refusal.components(separatedBy: "exclu").count, 2,
+                       "“excluded” or “exclusion” said more than once")
+    }
+
+    func testRefusalReadsOnceForATitleRule() throws {
+        let v = ExclusionList.defaults.check(bundleID: "com.google.Chrome",
+                                             windowTitle: "Online Banking — Chase")
+        let refusal = ExclusionList.refusal(appName: "Google Chrome",
+                                            reason: try XCTUnwrap(v.reason))
+        XCTAssertEqual(refusal, "Not looking at Google Chrome: its window title is on the "
+                              + "exclusion list (title: online banking).")
+        XCTAssertEqual(refusal.components(separatedBy: "exclu").count, 2,
+                       "“excluded” or “exclusion” said more than once")
+    }
+
     func testRoundTripsThroughText() {
         var list = ExclusionList(rules: [])
         list.add(.init(kind: .bundleID, pattern: "com.example.bank"))

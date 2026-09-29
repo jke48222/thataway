@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security problem
+    url: https://github.com/jke48222/thataway/blob/main/SECURITY.md
+    about: Please report security problems privately, as SECURITY.md describes.
+  - name: Read the FAQ
+    url: https://github.com/jke48222/thataway#faq
+    about: Permissions, excluded apps, the vision model and uninstalling.

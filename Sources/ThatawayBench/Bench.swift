@@ -956,7 +956,7 @@ struct Bench {
                            rules: ExclusionList = ExclusionStore().current) -> Bool {
         let verdict = rules.check(bundleID: bundleID, windowTitle: windowTitle)
         guard verdict.excluded else { return false }
-        print("  \(name) is on the exclusion list (\(verdict.reason ?? "excluded")): skipped.")
+        print("  \(name) skipped: \(verdict.reason ?? "excluded").")
         return true
     }
 

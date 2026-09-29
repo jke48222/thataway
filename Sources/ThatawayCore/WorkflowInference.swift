@@ -210,17 +210,30 @@ public enum WorkflowInference {
     /// The most prominent labelled element present after but not before —
     /// by area, because when a sheet opens the sheet itself is the event, not
     /// the dozen buttons that arrived inside it.
+    ///
+    /// An arrival is kept only if replay would see it arrive: the same
+    /// `LessonEngine.isSatisfied(.elementAppears)` check replay runs, absent
+    /// before and present after, not an exact-label comparison. Two labels
+    /// fail it. A button "Advanced Options…" that opens a sheet titled
+    /// "Advanced Options" gives the sheet a label that already resolves to
+    /// the button before the click. A sheet titled "Open" has a label made
+    /// only of stop words, which resolves nowhere. Either would leave the
+    /// step waiting for its timeout, so each is skipped for the next biggest
+    /// arrival.
     static func newestArrival(before: [AXNode], after: [AXNode]) -> String? {
         let beforeLabels = Set(before.compactMap { bestLabel($0)?.lowercased() })
-        let fresh = after.filter { n in
-            guard let l = bestLabel(n) else { return false }
-            return !beforeLabels.contains(l.lowercased())
-        }
-        let biggest = fresh.max { a, b in
-            (a.bounds.cg.width * a.bounds.cg.height)
-                < (b.bounds.cg.width * b.bounds.cg.height)
-        }
-        return biggest.flatMap(bestLabel)
+        func area(_ n: AXNode) -> CGFloat { n.bounds.cg.width * n.bounds.cg.height }
+        let fresh = after
+            .compactMap { n -> (label: String, area: CGFloat)? in
+                guard let l = bestLabel(n), !beforeLabels.contains(l.lowercased())
+                else { return nil }
+                return (l, area(n))
+            }
+            .sorted { $0.area > $1.area }
+        return fresh.first { arrival in
+            LessonEngine.isSatisfied(.elementAppears(arrival.label), target: "",
+                                     before: before, after: after)
+        }?.label
     }
 
     /// "the Gmail button in the Bookmarks" → "Gmail" — the bare label, for

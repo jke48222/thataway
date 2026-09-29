@@ -689,7 +689,7 @@ public final class AXCache {
     }
 
     public var statusLine: String {
-        if let why = lastExclusionReason { return "excluded: \(why)" }
+        if let why = lastExclusionReason { return "not read: \(why)" }
         lock.lock(); defer { lock.unlock() }
         guard let e = entry else { return "no tree cached" }
         return String(format: "%@: %d nodes, %.0f ms old, %d refreshes, %d warm / %d cold",

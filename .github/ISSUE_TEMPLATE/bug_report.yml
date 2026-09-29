@@ -1,0 +1,91 @@
+name: Bug report
+description: Something in Thataway did not work the way the README says it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Please leave out anything personal: names, emails, messages,
+        account details or screenshots of a real desktop. A fictional window shows the bug just as
+        well. Security problems go to the address in SECURITY.md, not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what Thataway did instead.
+      placeholder: I pressed Option Space in System Settings, typed "wifi", and the ring landed on the Bluetooth row.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Press Option Space and type ...
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: app
+    attributes:
+      label: App in front
+      description: The app you asked about, and its version if you know it.
+      placeholder: System Settings, macOS 15.3
+    validations:
+      required: true
+  - type: textarea
+    id: bar
+    attributes:
+      label: What the bar or the menu said
+      description: The shortlist, the caption, or the status lines in the menu bar menu.
+  - type: dropdown
+    id: result
+    attributes:
+      label: What the pointer did
+      options:
+        - Solid ring on the wrong control
+        - Dashed amber ring on the wrong control
+        - No pointer
+        - Pointer in the wrong place or on the wrong display
+        - Something else (described above)
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac
+      placeholder: macOS 15.3, MacBook Air M2
+    validations:
+      required: true
+  - type: dropdown
+    id: signing
+    attributes:
+      label: How the app was signed
+      description: make-app.sh prints this line when it finishes.
+      options:
+        - Developer ID
+        - Apple Development
+        - Ad hoc
+        - Not sure
+  - type: dropdown
+    id: vision
+    attributes:
+      label: Is the vision fallback installed?
+      options:
+        - "No"
+        - "Yes"
+        - Not sure
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The output of `git rev-parse --short HEAD` in your clone.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: |
+        Optional. Console lines that start with "Thataway:". Read them first and remove any
+        personal text, such as window titles or control names from private apps.
+      render: text

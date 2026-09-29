@@ -124,7 +124,7 @@ final class KitPolicyTests: XCTestCase {
             throw XCTSkip("no app in front to refuse (headless session)")
         }
         XCTAssertEqual(cache.lastExclusionReason, "test: refused")
-        XCTAssertTrue(cache.statusLine.hasPrefix("excluded: "))
+        XCTAssertTrue(cache.statusLine.hasPrefix("not read: "))
         cache.invalidate()
         XCTAssertNil(cache.lastExclusionReason, "a stale reason outlived a rule change")
     }

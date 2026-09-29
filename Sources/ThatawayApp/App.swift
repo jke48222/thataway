@@ -139,6 +139,13 @@ final class ThatawayApp: NSObject, NSApplicationDelegate {
     }
 
     static func main() {
+        #if DEBUG
+        // Debug builds only, and only with an explicit --promo or
+        // --promo-stills flag: the stage that renders docs/media
+        // (Sources/ThatawayApp/Promo). It runs before the delegate exists, so
+        // no service, file or permission prompt of the real app is touched.
+        if PromoStage.runIfRequested(CommandLine.arguments) { return }
+        #endif
         let app = NSApplication.shared
         let delegate = ThatawayApp()
         app.delegate = delegate
@@ -818,7 +825,7 @@ final class ThatawayApp: NSObject, NSApplicationDelegate {
             let front = NSWorkspace.shared.frontmostApplication
             let name = front.flatMap { $0.processIdentifier == me ? nil : $0.localizedName }
                 ?? "this app"
-            return "Not looking at \(name): it is excluded (\(why))."
+            return ExclusionList.refusal(appName: name, reason: why)
         }
         return "No accessible window in front."
     }
@@ -923,7 +930,7 @@ final class ThatawayApp: NSObject, NSApplicationDelegate {
                         note: "not captured: \(why)")
             } else {
                 // The reason first: it is the part the user can act on.
-                notify("Screen not captured (\(why)), and nothing in \(tree.appName)'s "
+                notify("Screen not captured because \(why), and nothing in \(tree.appName)'s "
                        + "accessibility tree matches “\(query)”.",
                        query: query, spoken: spoken, said: spokenMiss(appName: tree.appName))
             }
@@ -1152,7 +1159,7 @@ final class ThatawayApp: NSObject, NSApplicationDelegate {
                 return
             }
             if let why = ScreenGrab.frontWindowExclusion(pid: tree.pid, exclusions: rules) {
-                refusal = "\(tree.appName) is showing an excluded window (\(why))"
+                refusal = "\(tree.appName)'s front window changed: \(why)"
                 return
             }
             if DisplaySpace.current().display(at: displayIndex) == nil {
@@ -1590,7 +1597,7 @@ final class ThatawayApp: NSObject, NSApplicationDelegate {
                 // excluded app's tree is not read, not even to count it.
                 let verdict = exclusions.check(bundleID: app.bundleIdentifier, windowTitle: nil)
                 if verdict.excluded {
-                    print("  \(name): excluded, not read (\(verdict.reason ?? "excluded"))")
+                    print("  \(name): not read, \(verdict.reason ?? "excluded")")
                     continue
                 }
                 do {

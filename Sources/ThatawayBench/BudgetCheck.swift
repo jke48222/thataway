@@ -40,7 +40,7 @@ enum BudgetCheck {
         Thread.sleep(forTimeInterval: 0.5)
         guard let tree = cache.tree() else {
             if let why = cache.lastExclusionReason {
-                print("  The frontmost app is on the exclusion list (\(why)): skipped.")
+                print("  The frontmost app was skipped: \(why).")
             } else {
                 print("  No accessible frontmost window: focus an app and re-run.")
             }

@@ -185,6 +185,82 @@ final class WorkflowInferenceTests: XCTestCase {
             .elementAppears("Share Options"))
     }
 
+    /// A button "Advanced Options..." opens a sheet titled "Advanced
+    /// Options". The sheet's label is new as a string, but it already
+    /// resolves to the button before the click, so replay can never see it
+    /// appear: recording it stalled the step until its 120 s timeout. The
+    /// biggest arrival replay can observe is what gets recorded instead.
+    func testArrivalThatAlreadyResolvesBeforeTheClickIsSkipped() {
+        let before = tree + [node(4, parent: 1, depth: 2, role: "AXButton",
+                                  title: "Advanced Options...",
+                                  rect: CGRect(x: 600, y: 10, width: 140, height: 40))]
+        let after = before
+            + [node(7, parent: 0, role: "AXSheet", title: "Advanced Options",
+                    rect: CGRect(x: 300, y: 200, width: 600, height: 400)),
+               node(8, parent: 7, depth: 2, role: "AXCheckBox", title: "Verbose Logging",
+                    value: "0", rect: CGRect(x: 340, y: 300, width: 160, height: 24))]
+        let query = "the Advanced Options... button in the Toolbar"
+        XCTAssertTrue(LessonEngine.resolves("Advanced Options", in: before, nil,
+                                            AXResolver.hitThreshold),
+                      "the premise: the sheet's title already resolves to the button")
+
+        let completion = WorkflowInference.inferCompletion(clickedQuery: query,
+                                                           before: before, after: after)
+        XCTAssertEqual(completion, .elementAppears("Verbose Logging"))
+        XCTAssertTrue(LessonEngine.isSatisfied(completion, target: query,
+                                               before: before, after: after),
+                      "the recorded condition must fire on the transition it was recorded from")
+
+        // With nothing else arriving, the sheet is still not recorded.
+        let sheetOnly = Array(after.dropLast())
+        XCTAssertNotEqual(
+            WorkflowInference.inferCompletion(clickedQuery: query,
+                                              before: before, after: sheetOnly),
+            .elementAppears("Advanced Options"))
+    }
+
+    /// Every recorded appearance must fire on the click it was recorded from.
+    /// A sheet titled "Open" or a bar titled "Find" has a label made only of
+    /// stop words, which resolves in no tree, so the step would wait for its
+    /// timeout; the next arrival that replay can see is recorded instead. The
+    /// ordinary cases keep recording the sheet or window itself.
+    func testRecordedAppearanceFiresOnItsOwnClick() {
+        let cases: [(clicked: String, arrivals: [AXNode], expected: String)] = [
+            ("Open…", [node(7, parent: 0, role: "AXSheet", title: "Open",
+                            rect: CGRect(x: 200, y: 100, width: 800, height: 600)),
+                       node(8, parent: 7, depth: 2, role: "AXButton", title: "Show Options",
+                            rect: CGRect(x: 250, y: 600, width: 120, height: 30))],
+             "Show Options"),
+            ("Search", [node(7, parent: 0, role: "AXGroup", title: "Find",
+                             rect: CGRect(x: 0, y: 60, width: 1200, height: 40)),
+                        node(8, parent: 7, depth: 2, role: "AXTextField", title: "Replace",
+                             rect: CGRect(x: 250, y: 65, width: 200, height: 30))],
+             "Replace"),
+            ("Export", [node(7, parent: 0, role: "AXSheet", title: "Export Settings",
+                             rect: CGRect(x: 200, y: 100, width: 800, height: 600)),
+                        node(8, parent: 7, depth: 2, role: "AXCheckBox", title: "Include Metadata",
+                             rect: CGRect(x: 250, y: 300, width: 120, height: 30))],
+             "Export Settings"),
+            ("Settings", [node(7, depth: 0, role: "AXWindow", title: "Preferences",
+                               rect: CGRect(x: 200, y: 100, width: 800, height: 600)),
+                          node(8, parent: 7, role: "AXTab", title: "General",
+                               rect: CGRect(x: 250, y: 120, width: 80, height: 30))],
+             "Preferences"),
+        ]
+        for c in cases {
+            let before = tree + [node(4, parent: 1, depth: 2, role: "AXButton", title: c.clicked,
+                                      rect: CGRect(x: 600, y: 10, width: 80, height: 40))]
+            let after = before + c.arrivals
+            let query = "the \(c.clicked) button in the Toolbar"
+            let completion = WorkflowInference.inferCompletion(clickedQuery: query,
+                                                               before: before, after: after)
+            XCTAssertEqual(completion, .elementAppears(c.expected), "clicking \(c.clicked)")
+            XCTAssertTrue(LessonEngine.isSatisfied(completion, target: query,
+                                                   before: before, after: after),
+                          "the step recorded from \(c.clicked) fires on its own click")
+        }
+    }
+
     func testVanishingElementInfersDisappears() {
         var after = tree
         after.removeAll { $0.id == 2 }

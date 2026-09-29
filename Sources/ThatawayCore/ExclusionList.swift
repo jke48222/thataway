@@ -72,9 +72,31 @@ public struct ExclusionList: Equatable, Sendable {
         public let excluded: Bool
         /// The rule that fired, for the visible explanation. A silent refusal
         /// looks like a bug; a stated one looks like a product.
+        ///
+        /// A clause that reads on its own and after a colon ("not captured:
+        /// …"), naming the rule the way the exclusions file writes it, so the
+        /// user can find the line to change. It says "exclusion list" once,
+        /// and callers must not wrap it in another "excluded".
         public let reason: String?
 
         public static let allowed = Verdict(excluded: false, reason: nil)
+    }
+
+    /// Why `rule` refused, as `Verdict.reason` states it.
+    public static func reason(for rule: Rule) -> String {
+        switch rule.kind {
+        case .bundleID:
+            return "the app is on the exclusion list (bundle: \(rule.pattern))"
+        case .titleContains:
+            return "its window title is on the exclusion list (title: \(rule.pattern))"
+        }
+    }
+
+    /// The bar's refusal for an app the gate turned away: "Not looking at
+    /// TextEdit: the app is on the exclusion list (bundle: com.apple.textedit)."
+    /// `reason` is a `Verdict.reason`, which is all the cache keeps.
+    public static func refusal(appName: String, reason: String) -> String {
+        "Not looking at \(appName): \(reason)."
     }
 
     /// Prefix match, not equality: bundle IDs are hierarchical, so
@@ -88,12 +110,10 @@ public struct ExclusionList: Equatable, Sendable {
             switch rule.kind {
             case .bundleID:
                 guard !bundle.isEmpty, bundle.hasPrefix(rule.pattern) else { continue }
-                return Verdict(excluded: true, reason: "app is excluded (\(rule.pattern))")
             case .titleContains:
                 guard !title.isEmpty, title.contains(rule.pattern) else { continue }
-                return Verdict(excluded: true,
-                               reason: "window title matches “\(rule.pattern)”")
             }
+            return Verdict(excluded: true, reason: Self.reason(for: rule))
         }
         return .allowed
     }
