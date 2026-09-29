@@ -305,7 +305,7 @@ numbers above** — Chrome's toolbar is a far easier target than Logic's dense
 professional UI, and the full-frame baseline scores 83% here versus 40% there.
 The comparison that matters is between conditions on the *same* window.
 
-## Finding 9 — The AX resolver answers everything, in 0.067 ms.
+## Finding 9 — The AX resolver answers all 12 Chrome targets, in 0.067 ms.
 
 This is the number the whole architecture rests on and nothing in Phase 0
 measured it.
@@ -341,6 +341,10 @@ Four scoring rules earned their place by failing first:
   See below.
 
 ## Finding 10 — Aimed cropping matches full-frame accuracy at 3× the speed.
+
+> Later note: this holds for this run only. The `live-eval.json` run later the same day put the
+> aimed crop one target behind the full frame (10 of 12 against 11 of 12, at 1,204 ms against
+> 7,317 ms). The table "Aimed crops: two runs that disagree" in `docs/BENCHMARKS.md` has both runs.
 
 | condition | accuracy | TTFT p50 | image tokens | deployable? |
 |---|---|---|---|---|
@@ -499,8 +503,8 @@ Raw results are in `bench-data/`: `holo-7b-bf16.json`, `holo-7b-4bit.json`,
 # Phase 1 — It points, correctly
 
 Built: `ThatawayApp` — a menu-bar-only accessory app. Hotkey (⌥Space), type a
-target in plain language, and a cursor flies along a bezier arc to the exact
-control. **No voice, no vision model, no cloud, no network at all.**
+target in plain language, and a drawn pointer arcs along a bezier curve to the
+exact control. **No voice, no vision model, no cloud, no network at all.**
 
 Verified end to end with `--selftest`, which prints every coordinate the
 pointer will use rather than taking a screenshot — this app exists to look at
@@ -810,7 +814,11 @@ Chrome, 12 targets, four conditions:
 
 The hybrid resolved **12/12 on the tree alone** and never loaded the model.
 
-**These numbers are not comparable to 57.94 or 63.25.** One app, twelve
+> Later note: the 0.1 ms in the `ax_only` and `hybrid` rows was not timed. `Tools/live_eval.py`
+> writes it as a literal. The measured resolver cost is Finding 9's 0.067 ms p50 from
+> `bench-data/axplan-chrome.json`.
+
+**These numbers are not comparable to the published ScreenSpot-Pro scores in Finding 18.** One app, twelve
 targets, and Chrome's toolbar is a far easier target set than ScreenSpot-Pro's
 dense professional UIs — the same Holo1.5 scored 40% on Logic Pro earlier in
 this document and 91.7% here. The honest claim is narrower and still
@@ -1014,7 +1022,7 @@ not a redesign.
 
 # Phase 4 (continued) — Menus, and un-breaking the built-in lessons
 
-Finding 36's limitation turned out to be a live defect, not a future one: the
+The menu-bar recording limitation above turned out to be a live defect, not a future one: the
 built-in lessons shipped in Phase 3 teach *through menus* ("Open the app menu,
 choose Settings") — and the extractor walked only the focused window's
 subtree, where the menu bar does not live. The lessons could not resolve their
