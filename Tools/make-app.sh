@@ -51,9 +51,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
   <key>NSHumanReadableCopyright</key><string>Copyright 2026 Jalen Edusei.</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>The coach listens only while you hold the shortcut, so you can name what you are looking for out loud. Recognition runs on this Mac; no audio leaves it.</string>
+  <string>Thataway listens only while you hold the shortcut, so you can name what you are looking for out loud. Recognition runs on this Mac; no audio leaves it.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
-  <string>Turns what you say while holding the shortcut into a target to point at. On-device recognition is required: the coach refuses rather than sending audio to a server.</string>
+  <string>Turns what you say while holding the shortcut into a target to point at. On-device recognition is required: Thataway turns voice off rather than sending audio to a server.</string>
 </dict>
 </plist>
 PLIST
