@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest something Thataway should do.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thataway draws a pointer and never moves the real cursor or clicks, so requests for
+        automation are out of scope. Everything else is welcome.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What were you trying to do, and where did Thataway fall short?
+      placeholder: I help my parents over the phone, and ...
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like
+      description: How it could work, from your side of the screen.
+    validations:
+      required: true
+  - type: textarea
+    id: apps
+    attributes:
+      label: Apps involved
+      description: The apps where you would use this, if it is specific to some.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today
+      description: Any workaround you use now.
