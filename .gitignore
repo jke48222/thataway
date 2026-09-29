@@ -1,6 +1,8 @@
-# Swift build output
+# Swift build output. build/ also holds the raw promo takes and masters
+# (build/media-raw) that scripts/make_media.sh records.
 .build/
 build/
+dist/
 *.xcodeproj
 *.xcworkspace
 DerivedData/
@@ -12,9 +14,22 @@ DerivedData/
 # local rather than being published.
 bench-data/*.png
 
-# Local machine state
+# Raw media takes stay local; only the files in docs/media are published
+docs/media/raw/
+*.mov
+# The 16 MB film master goes on the release page; the README and site use the web cut
+docs/media/thataway-promo.mp4
+
+# Vercel: the local project link and the site assembled by vercel.json
+.vercel/
+.vercel-out/
+
+# Local machine state and editor config
 .DS_Store
 *.log
+.vscode/
+.idea/
+*.local
 
 # Python bytecode from the Tools/ harnesses
 __pycache__/

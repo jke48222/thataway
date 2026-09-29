@@ -139,6 +139,13 @@ final class ThatawayApp: NSObject, NSApplicationDelegate {
     }
 
     static func main() {
+        #if DEBUG
+        // Debug builds only, and only with an explicit --promo or
+        // --promo-stills flag: the stage that renders docs/media
+        // (Sources/ThatawayApp/Promo). It runs before the delegate exists, so
+        // no service, file or permission prompt of the real app is touched.
+        if PromoStage.runIfRequested(CommandLine.arguments) { return }
+        #endif
         let app = NSApplication.shared
         let delegate = ThatawayApp()
         app.delegate = delegate
